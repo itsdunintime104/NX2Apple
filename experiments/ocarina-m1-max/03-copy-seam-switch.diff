@@ -1,0 +1,190 @@
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -1499,6 +1499,14 @@
+ static int g_end_heap;   // the last draw pass ended with the full barrier only because image heaps were alive (draw-pass full barriers line)
+ static int bar_heap_ok(void) { static int m = -1; if (m < 0) { const char *e = getenv("DM_NVN_BARRIER_HEAP"); m = !(e && !strcmp(e, "0")); if (!m) MLOG("DM_NVN_BARRIER_HEAP=0: while image heaps are alive, draw passes end and begin with full barriers"); } return m || !g_image_heap_n; }
+ static int g_last_end_relaxed, g_game_barrier;   // the last encoder ended was a draw pass with the relaxed end barrier (nothing else since); the bits of the game's nvnCommandBufferBarrier calls since the last draw pass began
++// DM_NVN_COPY_SEAM=1 (default off; ab: alternated with the DM_AB phases): a draw pass that follows a copy encoder which held only the game's texture-to-texture copies, itself opened after
++// a draw pass that ended relaxed, begins with a barrier for its fragment stage alone, so its vertex, object and mesh work need not wait for those copies. The memory the GPU wrote since
++// the last full barrier (the attachments of the passes and the copies' destinations: g_seam_r) is checked against what each draw of that pass reads before its fragment stage
++// (seam_draw); the first draw that may read it puts the wait back for the rest of the pass
++static int g_seam_ok, g_seam_t2t, g_seam_pending, g_seam_live, g_seam_pass_safe, g_seam_copies, g_seam_from_relaxed, g_seam_n;   // the set lists everything written since the last full end barrier (m4_end); blit() is called for a texture-to-texture copy; the copy encoder ended with the seam barrier; copies since the last full end barrier are not ordered before later vertex work; the open pass's vertex, object and mesh stages wait for everything (its begin barrier, or one a draw put back); seam copies since the last draw pass ended; the copy encoder was opened after a draw pass that ended relaxed; ranges in g_seam_r
++static uint64_t g_seam_skip, g_seam_back;   // draw passes begun on the seam path; of them, passes where a draw put the vertex barrier back
++void mtl_seam_stats(uint64_t *skip, uint64_t *back) { *skip = g_seam_skip; *back = g_seam_back; }
++static void seam_add(uint64_t a, uint64_t sz); static void seam_rt_add(void);
+ // Whether the game's barriers since the last draw pass began (g_game_barrier: their bits) need the next pass's full barrier. NVN's ORDER_FRAGMENTS (and its tiled form) makes later
+ // fragment work wait for earlier work, while later primitives may start at once; INVALIDATE_TEXTURE / SHADER make the writes visible to that ordered work. The relaxed end barrier
+ // of a draw pass orders its vertex and fragment stages before the fragment, dispatch and copy stages of later work with the device made visible, which is that much. Only
+@@ -1517,11 +1525,17 @@
+ // any later encoder reads them. A copy encoder that wrote through an aliased buffer address (g_blit_alias) keeps the alias flush on its end barrier as well
+ // DM_NVN_END_ALIAS=1 puts the alias flush back on every end barrier (ab: alternated with the DM_AB phases, for measuring)
+ static int sw_mode(const char *name, int dflt); static inline int sw_on(int m);
++static int seam_on(void) { static int m = -1, once; if (m < 0) m = sw_mode("DM_NVN_COPY_SEAM", 0); int on = m && sw_on(m); if (on && !once++) MLOG("DM_NVN_COPY_SEAM: a draw pass after the game's texture-to-texture copies begins its vertex work without waiting for them (a draw that reads GPU-written memory before its fragment stage puts the wait back)"); return on; }
+ static inline void m4_end(id e) {
+     gp_end(e);
+     static int end_alias = -1; if (end_alias < 0) end_alias = sw_mode("DM_NVN_END_ALIAS", 0);
+     MTL4VisibilityOptions vis = e == g_blit && g_blit_alias ? blit_vis() : end_alias && sw_on(end_alias) ? resource_vis() : MTL4VisibilityOptionDevice; if (e == g_blit) g_blit_alias = 0;
+-    if ([e conformsToProtocol:@protocol(MTL4CommandEncoder)]) [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:vis];
++    int seam = e == g_blit && g_seam_ok && g_seam_copies > 0 && g_seam_from_relaxed && [e conformsToProtocol:@protocol(MTL4CommandEncoder)] && seam_on();   // a copy encoder of texture-to-texture copies alone, opened after a draw pass that ended relaxed (DM_NVN_COPY_SEAM)
++    if (e != g_blit) g_seam_ok = 0;   // any other encoder writes memory the seam set does not list
++    if (seam) { [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageFragment | MTLStageDispatch | MTLStageBlit visibilityOptions:vis]; g_seam_live = 1; }   // the vertex, object and mesh work of every later encoder does not wait for these copies, until the next full end barrier below (enc_r_begin_pass, seam_draw)
++    else if ([e conformsToProtocol:@protocol(MTL4CommandEncoder)]) { [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:vis];
++        g_seam_live = 0; if (seam_on()) { g_seam_n = 0; g_seam_ok = 1; } }   // all later work waits for this encoder, which waited for everything before it (its fragment stage at least, for a draw pass): the seam set starts again
++    g_seam_pending = seam;
+     [e endEncoding]; g_last_end_relaxed = 0; g_end_heap = 0; cm_enc_mark(-1);
+ }
+ // DM_NVN_BARRIER=game (default the profile's draw_barriers, full unless it says game): draw passes are ordered by the game's own barriers. A draw pass ends with a barrier from its vertex and fragment stages to the fragment, compute and copy stages of
+@@ -1629,12 +1643,18 @@
+ }
+ static inline id<MTL4RenderCommandEncoder> enc_r_begin_pass(MTL4RenderPassDescriptor *d) { g_cm_enc++; cm_enc_mark(2);   // the draw passes (rp_begin_ex); see barrier_game
+     id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d]; cm_enc_mark(0);
+-    if (g_last_end_relaxed && !bar_game_full() && barrier_game() && bar_heap_ok()) g_bar_skip++;
+-    else { [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()]; g_bar_full++; g_bar_why[!barrier_game() ? 3 : !g_last_end_relaxed ? (g_end_heap ? 2 : 0) : bar_game_full() ? 1 : 2]++; }
++    int seam = g_seam_pending && g_seam_ok && barrier_game() && bar_heap_ok() && !(g_game_barrier & NVN_BARRIER_ORDER_INDIRECT_DATA_BIT) && seam_on();   // after a copy encoder of texture-to-texture copies alone (m4_end)
++    if (seam) { [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageFragment visibilityOptions:resource_vis()]; g_seam_skip++; g_seam_pass_safe = 0; }   // the fragment stage waits for everything; the stages before it wait only when a draw needs it (seam_draw)
++    else if (g_last_end_relaxed && !bar_game_full() && barrier_game() && bar_heap_ok()) { g_bar_skip++; g_seam_pass_safe = 0; }
++    else { [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()]; g_bar_full++; g_bar_why[!barrier_game() ? 3 : !g_last_end_relaxed ? (g_end_heap ? 2 : 0) : bar_game_full() ? 1 : 2]++; g_seam_pass_safe = 1; }   // safe: all of this pass's stages wait (later passes' do not: the seam set stays until a full end barrier, m4_end)
++    g_seam_pending = 0; g_seam_copies = 0;
++    if (seam_on()) seam_rt_add(); else g_seam_ok = 0;   // this pass's attachments are written from here on; with the switch off the set is not kept, so no seam until the next full end barrier with it on
++    if (g_seam_live && !g_seam_pass_safe && !g_seam_ok) { [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageVertex | MTLStageObject | MTLStageMesh visibilityOptions:resource_vis()]; g_seam_pass_safe = 1; }   // copies are still unordered before vertex work and the set cannot tell what a draw may read: this pass waits whole
+     g_game_barrier = 0;
+     [e setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [e setArgumentTable:g_ft atStages:MTLRenderStageFragment]; gp_begin(e, 'R', d); return e;
+ }
+ static inline void enc_r_end_pass(id e) {
++    g_seam_copies = 0;   // DM_NVN_COPY_SEAM: copies are counted from here
+     if (!barrier_game() || !bar_heap_ok()) { m4_end(e); g_end_heap = barrier_game(); return; }
+     // Object and mesh stages on both sides: a mesh pipeline's pass ends after its task and mesh work as well, and the next pass's task and mesh shaders wait for this pass's fragments
+     // (without them they could start before those fragments were done, as an iPhone run of Ocarina of Time showed)
+@@ -1706,10 +1726,12 @@
+ uint64_t mtl_blit_splits(void) { return g_blit_splits; }
+ static int enc_open(void);
+ static int g_blit_ct;   // the open copy encoder has the compute argument table set (dispatches share it, dispatch_enc)
+-static id<MTL4ComputeCommandEncoder> blit_open(void) { if (!g_blit) { ser_gate(); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:blit_vis()]; gp_begin(g_blit, 'C', nil); g_bw_n = g_br_n = 0; g_blit_ops = 0; g_blit_ct = 0; } return g_blit; }
++static id<MTL4ComputeCommandEncoder> blit_open(void) { if (!g_blit) { ser_gate(); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:blit_vis()]; gp_begin(g_blit, 'C', nil); g_bw_n = g_br_n = 0; g_blit_ops = 0; g_blit_ct = 0; g_seam_from_relaxed = g_last_end_relaxed; } return g_blit; }   // g_seam_from_relaxed: the encoder before this one was a draw pass that ended relaxed (m4_end)
+ static void ubd_flush(void); static int g_nubd;   // the inline updates deferred (see mtl_sub_update)
+ static int g_ubd_landing;
+ static id<MTL4ComputeCommandEncoder> blit_raw(void) {
++    int t2t = g_seam_t2t; g_seam_t2t = 0;   // copies that ending the pass or landing the deferred updates below put in this encoder are not the caller's texture-to-texture copy
++    if (!t2t || (g_nubd && !g_ubd_landing)) g_seam_ok = 0;   // DM_NVN_COPY_SEAM: this encoder holds something other than the game's texture-to-texture copies (an upload, a fill, a readback, a deferred inline update)
+     blit_note(); if (enc_open()) g_blit_splits++; rp_end(); id<MTL4ComputeCommandEncoder> e = blit_open();
+     if (g_nubd && !g_ubd_landing) { g_ubd_landing = 1; ubd_flush(); g_ubd_landing = 0; }   // deferred inline updates come before this copy or dispatch in command order
+     return e;
+@@ -7247,8 +7269,8 @@
+ }
+ static void swrite_note(NvProg *pr) {
+     if (!pr) return;
+-    if (g_pass_swrite) { g_vbuf_write_epoch++; return; }   // further shader writes also invalidate aligned vertex snapshots
+-    if (prog_swrites(pr)) { g_pass_swrite = 1; g_vbuf_write_epoch++; }
++    if (g_pass_swrite) { g_vbuf_write_epoch++; g_seam_ok = 0; return; }   // further shader writes also invalidate aligned vertex snapshots; DM_NVN_COPY_SEAM: as below, should an encoder ended through m4_end have reset the set while this pass is open
++    if (prog_swrites(pr)) { g_pass_swrite = 1; g_vbuf_write_epoch++; g_seam_ok = 0; }   // DM_NVN_COPY_SEAM: a draw's shader writes are not in the seam set
+ }
+ static void udc_note_draw(NvProg *pr, uint32_t raster_mask) {
+     int td = tbdr_on();
+@@ -13525,6 +13547,48 @@
+                 default: break; } } }
+     return 1;
+ }
++// DM_NVN_COPY_SEAM (see g_seam_ok): the storage the GPU wrote since the last full barrier of a draw pass, as ranges; a range that cannot be listed, or one too many, closes the seam path
++enum { SEAM_RN = 96 };
++static csh_rng g_seam_r[SEAM_RN];
++static void seam_add(uint64_t a, uint64_t sz) {
++    if (!a) return;   // no pool storage: no address can overlap it, and seam_draw takes a bound texture without storage as a hit
++    csh_rng r[1]; int n = 0; if (!csh_add(r, &n, a, sz)) { g_seam_ok = 0; return; }
++    for (int i = 0; i < g_seam_n; i++) if (g_seam_r[i].lo == r[0].lo && g_seam_r[i].hi == r[0].hi) return;
++    if (g_seam_n >= SEAM_RN) { g_seam_ok = 0; return; }
++    g_seam_r[g_seam_n++] = r[0];
++}
++static void seam_rt_add(void) {   // the attachments of the pass being opened (enc_r_begin_pass: rp_begin_ex_ attaches R.rt, or fewer of them)
++    for (int k = 0; k < 9; k++) { const tex_t *t = k == 8 ? R.rt.depth : k < R.rt.n ? R.rt.color[k] : NULL; if (t) seam_add((uint64_t)t->mem, t->L.size); }
++}
++static int seam_rng_hit(uint64_t a, uint64_t sz) { if (!a) return 0; csh_rng r[1]; int n = 0; return !csh_add(r, &n, a, sz) || csh_hit(r, n, g_seam_r, g_seam_n); }
++// A draw of a pass that began on the seam path (g_seam_live): 1 when its vertex, geometry, tessellation, task or mesh stage, its vertex streams, its indices or its indirect arguments
++// may read memory in the seam set, or read something that cannot be listed. The fragment stage (sh[1]) waits for everything already
++static int seam_draw_hit(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
++    if (!pr || (dw && dw->mdi_cnt) || (di && di->mdi_cnt)) return 1;
++    for (int k = 0; k < 16; k++) if (S.vbuf[k].size && seam_rng_hit(S.vbuf[k].address, S.vbuf[k].size)) return 1;
++    if (di && seam_rng_hit(di->ibuf, (uint64_t)(di->count > 0 ? di->count : 0) * 4 + 16)) return 1;
++    if (seam_rng_hit(dw ? dw->ind : di ? di->ind : 0, 32)) return 1;
++    static const int sts[4] = {0, 2, 3, 4};
++    for (int j = 0; j < 4; j++) { int st = sts[j]; __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh) continue;
++        if (sh->rf.bindless || sh->rf.dyn) return 1;
++        for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i];
++            switch (b->kind) {
++                case NVN_RB_CBUF: case NVN_RB_UBOP: if (b->reg >= 16 || seam_rng_hit(S.ubo[st][b->reg].addr, S.ubo[st][b->reg].size)) return 1; break;
++                case NVN_RB_SBUFP: if (b->reg >= 16 || seam_rng_hit(S.ssbo[st][b->reg].addr, S.ssbo[st][b->reg].size)) return 1; break;
++                case NVN_RB_TEX: { uint64_t h = tex_slot_h(S.tex[st], S.img[st], b->reg); int tid = (int)(h & 0xfffff); if (!tid) break;
++                    os_unfair_lock_lock(&g_rmu); tex_t t = tid < g_ntreg && g_treg[tid].ok ? g_treg[tid].t : (tex_t){0}; os_unfair_lock_unlock(&g_rmu);
++                    if (!t.serial || !t.mem || seam_rng_hit((uint64_t)t.mem, t.L.size)) return 1;
++                    break; }
++                case NVN_RB_TEXU: case NVN_RB_TEXD: case NVN_RB_TEXA: case NVN_RB_IMG: case NVN_RB_IMGU: case NVN_RB_TBUF: case NVN_RB_GMEM: case NVN_RB_SBUFU: return 1;   // reads (or writes) memory not listed here
++                default: break; } } }
++    return 0;
++}
++static void seam_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
++    if (!g_seam_live || g_seam_pass_safe || !g_enc || (g_seam_ok && !seam_draw_hit(pr, dw, di))) return;   // !g_seam_ok: the set no longer lists everything written, so any draw is a hit
++    [g_enc barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageVertex | MTLStageObject | MTLStageMesh visibilityOptions:resource_vis()];   // this draw and the pass's later ones wait for the copies whole, as the full barrier would have made them; later passes are checked again (g_seam_live stays)
++    g_seam_pass_safe = 1; g_seam_back++;
++    PD("M %llu copy seam: a draw reads GPU-written memory before its fragment stage; vertex barrier put back", g_stat_pass);
++}
+ // A dispatch at its place in the stream (S as it is there): its storage buffers (counted as written), and whether it samples a colour attachment of the pass (1), only the depth (2)
+ // rd (may be NULL): the memory it reads besides its storage buffers (uniform buffers and texture storage), to check against the occlusion reports it would move ahead of
+ static int csh_cs(NvShader *cs, const p_dispatch *dp, csh_rng *w, int *nw, int *depth, csh_rng *rd, int *nrd) {
+@@ -14007,6 +14071,7 @@
+     rr_snap(dw,di);
+ #endif
+     udc_note_draw(pr, raster_mask);
++    seam_draw(pr, dw, di);   // before this draw is encoded: its vertex, object and mesh work may need the wait the pass began without
+     swrite_note(pr); order_note(pr);
+     if (g_mtk.on) { mtk_encode(en); return; }
+     if (g_geo_mesh.on) { geo_mesh_encode(en); return; }
+@@ -14173,6 +14238,7 @@
+ static int dispatch_overlap(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_DISPATCH_OVERLAP"); v = e ? atoi(e) != 0 : DM_GAME_DISPATCH_OVERLAP; if (v) MLOG("dispatch overlap: the game's dispatches with no barrier of its between them run side by side (DM_NVN_DISPATCH_OVERLAP=0 orders each after the one before)"); } return v; }
+ static id<MTL4ComputeCommandEncoder> dispatch_enc(int game) {   // game: one of the game's dispatches (0: the host's own, ordered as a copy is)
+     id<MTL4ComputeCommandEncoder> e = blit_open(); g_gp_disp++;
++    if (!g_seam_t2t) g_seam_ok = 0;   // DM_NVN_COPY_SEAM: a dispatch writes memory the seam set does not list
+     int beside = game && g_blit_ops && g_blit_disponly && !g_cs_gbar && dispatch_overlap();
+     if (g_blit_ops && !beside) blit_barrier();
+     if (game) { g_disp_last_beside = beside; if (beside) g_disp_beside++; g_cs_gbar = 0; }
+@@ -14819,7 +14885,12 @@
+                  c->flags, (unsigned long)s.pixelFormat, (unsigned long)d.pixelFormat, s3, d3);
+         return;
+     }
+-    id<MTL4ComputeCommandEncoder> b = blit();
++    // DM_NVN_COPY_SEAM: this copy's destination joins the seam set. A primitive-ordering or indirect-data barrier of the game's from before the first copy after a draw pass orders
++    // the copies themselves after earlier vertex work, which the seam does not keep; a mirror readback is not a texture-to-texture copy
++    if (seam_on()) { if (!g_seam_pending && !g_seam_copies && (g_game_barrier & (NVN_BARRIER_ORDER_PRIMITIVES_BIT | NVN_BARRIER_ORDER_INDIRECT_DATA_BIT))) g_seam_ok = 0;
++        seam_add((uint64_t)c->dst->mem, c->dst->L.size); if (rb) g_seam_ok = 0; g_seam_t2t = 1; }
++    else g_seam_ok = 0;   // the destination is not in the set
++    id<MTL4ComputeCommandEncoder> b = blit(); g_seam_t2t = 0; g_seam_copies++;   // counted after blit(): it may end the open pass, which starts the count again (enc_r_end_pass)
+     if (s3)
+         enc_b_copy_texture(b, s, 0, sl, MTLOriginMake(c->sr.xoffset, c->sr.yoffset, c->sr.zoffset), MTLSizeMake(c->sr.width, c->sr.height, nz), d, 0, dl, MTLOriginMake(c->dr.xoffset, c->dr.yoffset, c->dr.zoffset));
+     else
+@@ -14899,7 +14970,7 @@
+     id<MTL4ComputeCommandEncoder> ce = [g_cb computeCommandEncoder];   // the scaler's encoders come after the frame's work so far: MetalFX opens encoders of its own, which take no barrier
+     [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit visibilityOptions:resource_vis()];
+     [ce barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];
+-    [ce endEncoding];
++    [ce endEncoding]; g_seam_ok = 0;   // DM_NVN_COPY_SEAM: the scaler's own encoders write its output with no end barrier, and the seam set does not list it
+     if (@available(macOS 27.0, iOS 27.0, *)) {} else if (c->base[DLSS_COLOR][0] || c->base[DLSS_COLOR][1] || c->base[DLSS_DEPTH][0] || c->base[DLSS_DEPTH][1] || c->base[DLSS_MOTION][0] || c->base[DLSS_MOTION][1] || c->base[DLSS_OUTPUT][0] || c->base[DLSS_OUTPUT][1]) {
+         static int once; if (!once++) MLOG("[RED] DLSS: rectangles away from the origin need macOS / iOS 27's MetalFX; taken from the origin");
+     }
+@@ -16038,7 +16109,7 @@
+         sc.colorTexture = color; sc.outputTexture = result; sc.inputContentWidth = cw; sc.inputContentHeight = ch;
+         [sc encodeToCommandBuffer:cb];
+     });
+-    g_last_end_relaxed = 0;   // the next pass waits for the scaler whole (enc_r_begin_pass)
++    g_last_end_relaxed = 0; g_seam_ok = 0;   // the next pass waits for the scaler whole (enc_r_begin_pass), on the copy seam path too: the scaler does not end through m4_end
+     if (!direct && !copy_t2t_draw(e->read, out, 0, 0, 0, 0, &at0o, &orr, 0, 0)) {
+         args_dirty_all(); g_up_mfx_kept++; return 0;   // only the scratch image was scaled; the game's shader can still produce the output
+     }
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -1826,7 +1826,7 @@
+             (unsigned long long)(cut - pcut), (unsigned long long)(ccut - pccut), (unsigned long long)(bsp - pbsp), (unsigned long long)(ud - pud), (unsigned long long)(uc - puc), (unsigned long long)(pm - ppm), (unsigned long long)(pr - ppr), (unsigned long long)(pf_ - ppf), (unsigned long long)(w5[1] - pw5[1]), (unsigned long long)(w5[2] - pw5[2]), (unsigned long long)(w5[3] - pw5[3]), (unsigned long long)(w5[0] - pw5[0]), (unsigned long long)(w5[4] - pw5[4]), (unsigned long long)(lt - plt), (unsigned long long)(ll - pll), (unsigned long long)(smp - psmp), (unsigned long long)(smc - psmc), (unsigned long long)(smw - psmw), (unsigned long long)(chm - pchm), (unsigned long long)(chd - pchd),
+             (unsigned long long)(chs[1] - pchs[1]), (unsigned long long)(chs[2] - pchs[2]), (unsigned long long)(chs[3] - pchs[3]), (unsigned long long)(chs[7] - pchs[7]), (unsigned long long)(chs[5] - pchs[5]),
+             (ld - pld) / 1048576.0 / nf, (st - pst) / 1048576.0 / nf, (fu - pfu) / nf, (udc - pudc) / 1048576.0 / nf); pbs = bs; pbf = bf; pcut = cut; pccut = ccut; pbsp = bsp; pud = ud; puc = uc; ppm = pm; ppr = pr; ppf = pf_; memcpy(pw5, w5, sizeof pw5); plt = lt; pll = ll; psmp = smp; psmc = smc; psmw = smw; pchm = chm; pchd = chd; memcpy(pchs, chs, sizeof pchs);
+-        { void mtl_barrier_why(uint64_t w[4]); static uint64_t pw[4]; uint64_t w[4]; mtl_barrier_why(w); LOG("[nvn] draw-pass full barriers up to frame %llu, per frame: after a non-draw encoder %.1f, after a game barrier %.1f, image heaps alive %.1f, barrier mode full %.1f", frame, (w[0] - pw[0]) / nf, (w[1] - pw[1]) / nf, (w[2] - pw[2]) / nf, (w[3] - pw[3]) / nf); memcpy(pw, w, sizeof pw); }
++        { void mtl_barrier_why(uint64_t w[4]); void mtl_seam_stats(uint64_t *skip, uint64_t *back); static uint64_t pw[4], pss, psb; uint64_t w[4], ss, sb; mtl_barrier_why(w); mtl_seam_stats(&ss, &sb); LOG("[nvn] draw-pass full barriers up to frame %llu, per frame: after a non-draw encoder %.1f, after a game barrier %.1f, image heaps alive %.1f, barrier mode full %.1f; copy seams relaxed %.1f, put back by a draw %.1f", frame, (w[0] - pw[0]) / nf, (w[1] - pw[1]) / nf, (w[2] - pw[2]) / nf, (w[3] - pw[3]) / nf, (ss - pss) / nf, (sb - psb) / nf); memcpy(pw, w, sizeof pw); pss = ss; psb = sb; }
+         { void mtl_cshoist_stop_ops(char *, size_t); char so[160]; mtl_cshoist_stop_ops(so, sizeof so); if (so[0]) LOG("[nvn] compute hoist up to frame %llu: scans stopped by op (nvn_obj.h op number = scans): %s", frame, so); }
+         void mtl_geohoist_stats(uint64_t *, uint64_t *, uint64_t *); static uint64_t pgh, pgr, pgs[6]; uint64_t gh, gr, gs[6]; mtl_geohoist_stats(&gh, &gr, gs);
+         if (gh != pgh || gr != pgr) LOG("[nvn] geometry hoist up to frame %llu: %llu draws prepared ahead of their pass in %llu runs; runs ended by a raster read %llu, a draw that cannot be passed %llu, the table %llu, a kernel or capture hazard %llu, a draw not lean %llu, another op %llu",
