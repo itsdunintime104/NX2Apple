@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: itsdunintime104 <270179414+itsdunintime104@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 02:53:52 +0100
+Subject: [PATCH] Mac: a Fullscreen resolution setting caps the drawable in
+ fullscreen (DM_OUTPUT_HEIGHT)
+
+In fullscreen the drawable follows the screen's own pixels: 4112x2580 on a 16-inch MacBook Pro in a scaled desktop mode. Ocarina of Time's docked picture is 2560x1440, so the present scales it up on the GPU to a drawable far larger than the picture.
+
+DM_OUTPUT_HEIGHT=<n> keeps the fullscreen drawable at the size where the 16:9 picture is n pixels high (1440 or 1080 in the settings window), and the compositor scales it to the screen. 0 or unset keeps the screen's own pixels, and a window always keeps its own. The two fullscreen observers call fitDrawable, so the cap is evaluated again when a transition is over.
+
+Checked on an M1 Max with Ocarina of Time: with 1080 the log shows "front end: drawable 1920x1205 (DM_OUTPUT_HEIGHT)" in fullscreen, and a window was not capped. test_launcher_settings covers the row. With a cap below the game's picture MetalFX presenting does nothing: the picture is scaled down.
+
+Upstream-Status: pending
+Reason: Ocarina of Time on a high-resolution Mac screen: a fullscreen size the player picks, so the GPU does not fill the screen's own pixels
+Issue: LNPANDY/NX2Apple#929
+
+---
+ dm/games/settings.tsv                    |  1 +
+ dm/host/front_mac.m                      | 15 +++++++++++----
+ dm/tools/tests/test_launcher_settings.py |  6 +++++-
+ docs/env_switches.tsv                    |  1 +
+ docs/settings.md                         |  9 +++++++--
+ 5 files changed, 25 insertions(+), 7 deletions(-)
+
+diff --git a/dm/games/settings.tsv b/dm/games/settings.tsv
+index 89c69f1..87f606a 100644
+--- a/dm/games/settings.tsv
++++ b/dm/games/settings.tsv
+@@ -23,6 +23,7 @@ DM_PRESENT_UPSCALE	choice	off=Standard,metalfx=MetalFX	off	always	Game	Upscaling
+ DM_UPSCALER	choice	game=Game's own,metalfx=MetalFX	game	DM_GAME_UPSCALER_N!=0	Game	Game's upscaler
+ DM_LANG	choice	languages	build:DM_LANG	languages>1	Game	Game language		level=basic
+ DM_FULLSCREEN	choice	0=Window,1=Fullscreen	0	platform:mac	Game	Display mode		level=basic
++DM_OUTPUT_HEIGHT	choice	0=Screen's own,1440=2560 × 1440,1080=1920 × 1080	0	platform:mac	Game	Fullscreen resolution	The picture is drawn at this size and the screen scales it up: less GPU time, a softer picture.	level=basic
+ DM_PICTURE_FIT	choice	fit=Fit,fill=Fill	fit	platform:ios	Game	Picture	Fill crops the game's 16:9 picture to cover the screen. Health bars, subtitles or maps near the edges can be cut off. A full-screen picture without cropping needs a patch for each game.
+ DM_SHOW_FPS	toggle	-	build:DM_SHOW_FPS	platform:ios	Game	Frame-rate counter
+ DM_TOUCH_HAPTICS	toggle	-	1	platform:ios	Controls	Touch feedback
+diff --git a/dm/host/front_mac.m b/dm/host/front_mac.m
+index b407953..507a072 100644
+--- a/dm/host/front_mac.m
++++ b/dm/host/front_mac.m
+@@ -483,11 +483,18 @@ void front_picture_shape(int w, int h) { if (w > 0 && h > 0) g_picture_aspect =
+ - (void)mouseUp:(NSEvent *)e { (void)e; front_controllers_mouse(NULL); }
+ // The drawable follows the view in pixels: a layer assigned to a layer-backed view kept the drawable at the first window's 1280x720 in fullscreen too, so the game picture was
+ // scaled down to it and up again by the compositor
++// DM_OUTPUT_HEIGHT=<n> (the settings window's Fullscreen resolution): in fullscreen the drawable is no larger than the size at which the game's 16:9 picture is n pixels
++// high (1440: 2560x1440, 1080: 1920x1080 inside it), and the compositor scales it to the screen; 0 or unset keeps the screen's own pixels. A window keeps its own pixels
+ - (void)fitDrawable {
+     CAMetalLayer *l = (CAMetalLayer *)self.layer; if (![l isKindOfClass:CAMetalLayer.class] || !self.window) return;
+     l.contentsScale = self.window.backingScaleFactor;
+-    NSSize px = [self convertSizeToBacking:self.bounds.size]; if (px.width < 1 || px.height < 1 || CGSizeEqualToSize(l.drawableSize, px)) return;
+-    l.drawableSize = px; LOG("front end: drawable %.0fx%.0f", px.width, px.height);
++    NSSize px = [self convertSizeToBacking:self.bounds.size]; if (px.width < 1 || px.height < 1) return;
++    static int cap = -1; if (cap < 0) { const char *e = getenv("DM_OUTPUT_HEIGHT"); cap = e ? atoi(e) : 0; if (cap < 0) cap = 0; }
++    double picture = fmin(px.height, px.width * 9 / 16);   // the height of the 16:9 picture inside the view
++    int capped = cap && (self.window.styleMask & NSWindowStyleMaskFullScreen) && picture > cap;
++    if (capped) px = NSMakeSize(round(px.width * cap / picture), round(px.height * cap / picture));
++    if (CGSizeEqualToSize(l.drawableSize, px)) return;
++    l.drawableSize = px; LOG("front end: drawable %.0fx%.0f%s", px.width, px.height, capped ? " (DM_OUTPUT_HEIGHT)" : "");
+ }
+ - (void)setFrameSize:(NSSize)s { [super setFrameSize:s]; [self fitDrawable]; }
+ - (void)viewDidChangeBackingProperties { [super viewDidChangeBackingProperties]; [self fitDrawable]; }
+@@ -1502,8 +1509,8 @@ void front_run(void (*guest)(void)) {
+         [nc addObserverForName:NSApplicationDidChangeScreenParametersNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); }];
+         // Entering and leaving fullscreen: the layer is layer-backed, so its frame (and with it the drawable) follows the
+         // content view by itself; only the scale factor has to be carried over to the screen the window ended up on. The screen's rate is matched in fullscreen only (screen_match_apply)
+-        [nc addObserverForName:NSWindowDidEnterFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); g_fullscreen = 1; g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
+-        [nc addObserverForName:NSWindowDidExitFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_fullscreen = 0; screen_refresh(win.screen); g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
++        [nc addObserverForName:NSWindowDidEnterFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); g_fullscreen = 1; g_layer.contentsScale = win.backingScaleFactor; [(DmGameView *)win.contentView fitDrawable]; screen_match_apply(); }];
++        [nc addObserverForName:NSWindowDidExitFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_fullscreen = 0; screen_refresh(win.screen); g_layer.contentsScale = win.backingScaleFactor; [(DmGameView *)win.contentView fitDrawable]; screen_match_apply(); }];
+         // DM_FOCUS_KEEP (on by default, =0 turns it off): the game stays in focus while its window is up, whichever app is active. Tears of the Kingdom and Ocarina of Time
+         // stop presenting out of focus, so clicking into another app read as a hang (no frame and no sound after the last focus change)
+         static int keep = -1; if (keep < 0) keep = !getenv("DM_FOCUS_KEEP") || atoi(getenv("DM_FOCUS_KEEP"));
+diff --git a/dm/tools/tests/test_launcher_settings.py b/dm/tools/tests/test_launcher_settings.py
+index c796c51..d53d943 100644
+--- a/dm/tools/tests/test_launcher_settings.py
++++ b/dm/tools/tests/test_launcher_settings.py
+@@ -110,9 +110,13 @@ class LauncherSettingsTests(unittest.TestCase):
+         self.assertEqual(build(BOTW, 'nvn', 'ios').keys(), ios.keys())   # ios when unset
+         self.assertEqual(set(ios) - set(mac), {'DM_SHOW_FPS', 'DM_TOUCH_HAPTICS', 'DM_PICTURE_FIT', 'DM_TOUCH_SIZE', 'DM_TOUCH_STICK'})
+         self.assertIn('DM_RUMBLE', mac); self.assertIn('DM_METAL_HUD', mac)
+-        self.assertEqual(set(mac) - set(ios), {'DM_FULLSCREEN', 'DM_SW2'})   # the Mac window's Display mode (front_mac.m reads 1 or 0); Switch 2 controllers (pad_switch2_apple.m, wired on the Mac only)
++        # the Mac window's Display mode (front_mac.m reads 1 or 0) and its Fullscreen resolution (fitDrawable); Switch 2 controllers (pad_switch2_apple.m, wired on the Mac only)
++        self.assertEqual(set(mac) - set(ios), {'DM_FULLSCREEN', 'DM_OUTPUT_HEIGHT', 'DM_SW2'})
+         s = mac['DM_FULLSCREEN']
+         self.assertEqual((s['kind'], s['default'], s['options'], s['level']), ('choice', '0', [['0', 'Window'], ['1', 'Fullscreen']], 'basic'))
++        s = mac['DM_OUTPUT_HEIGHT']   # the values are the picture's height in pixels, as front_mac.m reads them; 0 keeps the screen's own pixels
++        self.assertEqual((s['kind'], s['default'], [o[0] for o in s['options']], s['level']), ('choice', '0', ['0', '1440', '1080'], 'basic'))
++        self.assertEqual(list(mac).index('DM_OUTPUT_HEIGHT'), list(mac).index('DM_FULLSCREEN') + 1, 'the resolution follows the Display mode it belongs to')
+ 
+     def test_defaults_follow_each_platform_host(self):
+         # nvn_mtl.m pso4_on: Mac defaults on, iOS follows the profile. nvn_rec.h rec_on: iOS on, Mac off.
+diff --git a/docs/env_switches.tsv b/docs/env_switches.tsv
+index 1d325f0..5ba1fba 100644
+--- a/docs/env_switches.tsv
++++ b/docs/env_switches.tsv
+@@ -259,6 +259,7 @@ DM_OODLE_JOB	path	`=<job file>`: the host runs the game's own Oodle decoder on e
+ DM_OODLE_MODULES	path	The rewritten modules the Mac host's Oodle tool mode loads when `shader_split.py` decodes Trinity packs; set by the NSP script
+ DM_OODLE_SERVE	switch	`=1`: the host answers decode requests on stdin / stdout with the game's own Oodle (or LZ5) decoder from the guest main thread before the SDK starts, until stdin ends
+ DM_OPMODE	player	The operation mode the game sees: `0` handheld, `1` console (default: the profile's `op_mode`, console unless set); read once at startup
++DM_OUTPUT_HEIGHT	player	`=<n>` caps the Mac drawable in fullscreen at the size where the game's 16:9 picture is `n` pixels high (`1440`: 2560x1440, `1080`: 1920x1080), and the compositor scales it to the screen; `0` or unset keeps the screen's own pixels, and a window always keeps its own. The Mac settings window's Fullscreen resolution
+ DM_PAD_IDENTICAL	switch	`0` stops reading identical pads here when GameController lists fewer of their model than IOKit has, such as two Pro Controllers over USB (each a player of its own: a Pro Controller from its report 0x30, another model from its HID elements; `pad_hid_mac.h`, `pad_pro.h`); `DM_HID_PADS=0` stops it too; Mac only
+ DM_PAD_MAP	player	Mac controllers: `<name>=<name>,…` makes the button that sends the first by default send the second (or `none` / `Shake`), e.g. `A=B,B=A` swaps them (`input_map.h`); a Mac app also keeps it as the saved choice `launcher.DM_PAD_MAP`, used when the host takes the whole value
+ DM_PAD_MERGE	switch	`=1` merges every controller into player 1, as before, instead of giving each controller a player of its own (Mac and iOS)
+diff --git a/docs/settings.md b/docs/settings.md
+index 2f166f3..4e02423 100644
+--- a/docs/settings.md
++++ b/docs/settings.md
+@@ -6,7 +6,7 @@ The screen before the game starts shows the settings the game supports. A settin
+ - [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Game language](#game-language), [Picture](#picture), [Frame-rate counter](#frame-rate-counter)
+ - [Controls](#controls): [Touch feedback](#touch-feedback), [Touch controls size and left stick](#touch-controls-size-and-left-stick), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff), [Press a button to join](#press-a-button-to-join)
+ - [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Shader prefetch](#shader-prefetch), [Downsample HDR textures](#downsample-hdr-textures), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
+-- [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode)
++- [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode), [Fullscreen resolution](#fullscreen-resolution)
+ - [In-game menu](#in-game-menu)
+ - [TV](#tv)
+ - [Settings in a file](#settings-in-a-file)
+@@ -240,7 +240,7 @@ Sets every setting back to the game's tested default; **Play** then forgets your
+ 
+ ## The Mac settings window
+ 
+-A Mac app ([A Mac app](development.md#a-mac-app)) shows its settings in a window before the game starts. They are the same settings as on the iPhone, with the same defaults. The window shows the most used ones first: **Frame rate**, **Render scale**, **Console mode**, **Game language**, **Display mode** and **Game rumble**, when the game has them. **Render scale** shows the picture's size in pixels beside the percentage for the chosen **Console mode**, when the game's profile has it (Breath of the Wild: 1600 × 900 docked, 1280 × 720 handheld at 100 %). The others are under **Advanced settings**, in the usual sections, with **Reset to tested defaults**. The window remembers whether Advanced settings is open. **Frame-rate counter** and **Touch feedback** are only on the iPhone.
++A Mac app ([A Mac app](development.md#a-mac-app)) shows its settings in a window before the game starts. They are the same settings as on the iPhone, with the same defaults. The window shows the most used ones first: **Frame rate**, **Render scale**, **Console mode**, **Game language**, **Display mode**, **Fullscreen resolution** and **Game rumble**, when the game has them. **Render scale** shows the picture's size in pixels beside the percentage for the chosen **Console mode**, when the game's profile has it (Breath of the Wild: 1600 × 900 docked, 1280 × 720 handheld at 100 %). The others are under **Advanced settings**, in the usual sections, with **Reset to tested defaults**. The window remembers whether Advanced settings is open. **Frame-rate counter** and **Touch feedback** are only on the iPhone.
+ 
+ Click **Play** (or press Return) to start the game. **Quit**, ⌘Q or closing the window ends the app without the game. The app remembers your choices for that game, and a game started without the window, from a front end or with the window turned off, uses them too ([Saved choices](frontends.md#saved-choices)). A setting fixed by an `env.txt` or by the program that started the app is shown greyed out.
+ 
+@@ -250,6 +250,10 @@ Turn off **Show this window at launch** to start the game at once with your choi
+ 
+ **Window** or **Fullscreen**: how the game's window opens. ⌃⌘F or the green button changes it while you play. In an `env.txt`: `DM_FULLSCREEN=1` or `0`.
+ 
++### Fullscreen resolution
++
++**Screen's own**, **2560 × 1440** or **1920 × 1080**: the size the game's picture is drawn at in fullscreen. The screen scales a smaller picture up, which takes less GPU time on a screen with more pixels and looks softer. A window always keeps its own pixels. In an `env.txt`: `DM_OUTPUT_HEIGHT=1440`, `1080` or `0`.
++
+ ### Switch 2 controllers
+ 
+ **Off** by default. On, the game takes Joy-Con 2 and Pro Controller 2 over Bluetooth: hold the small Sync button on one during the game, until its player lights sweep, to pair it with this Mac; after that a press of any of its buttons connects it ([Switch 2 controllers](playing.md#switch-2-controllers-mac)). macOS asks for Bluetooth access the first time, and again after the app is packed again. In an `env.txt`: `DM_SW2=1`.
+@@ -290,6 +294,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under
+ | Console mode | `DM_OPMODE` | `1` docked, `0` handheld |
+ | Game language | `DM_LANG` | a language code, such as `ja` |
+ | Display mode (Mac) | `DM_FULLSCREEN` | `1` fullscreen, `0` a window |
++| Fullscreen resolution (Mac) | `DM_OUTPUT_HEIGHT` | `1440`, `1080`; `0` the screen's own pixels |
+ | Cloud saves folder (Mac) | `DM_SAVE_SYNC` | a folder; `icloud`: iCloud Drive › nxnative Saves; `0`: off |
+ | Picture (iPhone and iPad) | `DM_PICTURE_FIT` | `fit` 16:9 with black bars, `fill` covers the screen, cropped |
+ | Picture shape | `DM_SCREEN_ASPECT` | `auto` the app window's own shape where it is taller than 16:9 (iPad 4:3, iPhone Duo 1.43:1), else 16:9 (iOS only); `1.43` the iPhone Duo's shape, `0` 16:9 |
