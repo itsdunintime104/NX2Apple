@@ -87,7 +87,18 @@ The copy seam switch tried that for passes that follow only texture copies. It f
 - The assumption behind the switch (most copy steps between passes are texture copies) was not checked against such a dump before the switch was built.
 - The same run compared "every pass waits" with the normal state: 18.4 ms against 17.5 ms as the median of 15 phases each. Two states that ran identical code differed by 1.0 ms, and the scene moved during the run. So this run does not show whether overlap of vertex and fragment work shortens the frame on this GPU.
 
-Not found yet: the cause of the hitches. In two hitch frames the usual amount of work took 85 and 159 ms on the GPU, with no upload, no new pipeline and no allocator wait. A diagnostic line for such command buffers is in the test tree.
+Later the same day, from the same data and three more runs:
+
+- Overlap does help. The profiled frames of that run give the GPU's time for one frame directly, and two states that ran identical code agree within 0.15 ms: 18.1 ms with every pass waiting, 15.9 and 16.1 ms in the normal state. The 80 passes a frame that start without the full wait save about 2.1 ms, about 0.03 ms each.
+- The dump was read before the next build. In 15 of the 17 gaps with compute dispatches, the passes that follow do not read what the dispatches wrote before their fragment stage.
+- The switch was extended to those gaps: a dispatch's storage buffers and images join the list that each draw is checked against. In a run of 35 phases of 5 seconds it opened about 5 gaps a frame, and a draw closed one again in 0.1 to 0.5 frames. The GPU's time for one frame was 16.8 ms with it off and 17.2 ms with it on (means 17.07 and 17.06 ms). No measurable gain, which fits 5 gaps at 0.03 ms. The tester saw no picture fault.
+- What keeps the other gaps closed, per frame: a copy step that holds only uniform updates or host copies (13 to 14), an ordering barrier of the game from before the first write (6), a draw that writes memory from its shader (4). Opening all of them would be worth about 0.7 ms at most, with a rising risk for the picture.
+- The host's pass merging (`DM_NVN_TBDR=1`, off for this game) was tried once: no gain, more long frames, and wrong water. It stays off.
+- The fragment shaders of the costly passes were inspected for slow translation. They are large (3,000 to 6,000 lines, 16 to 23 texture reads), and no fault of that kind was found.
+
+**Decision of the tester, 11 Nov:** the game's own resolution at about 57 frames a second (17.4 to 17.5 ms in the test scene) is the accepted baseline. A lower render scale and dynamic resolution are rejected, because the picture comes first. The work on 60 at this resolution stops here.
+
+Not found yet: the cause of the hitches. In play, a hitch is one command buffer that the GPU holds for 20 to 150 ms, with no upload, no new pipeline, no allocator wait and no pattern in the residency numbers. So the cause is not visible from the game or the host. Other apps that use the GPU and swap are suspects, not tested yet.
 
 ## The model
 
@@ -100,10 +111,10 @@ Not found yet: the cause of the hitches. In two hitch frames the usual amount of
 
 Steps 1 and 2 of the earlier plan are done (build 5 measured, GPU overlap stopped). What is next:
 
-1. A clean run of two states in a fixed scene: every pass waits, and the normal state. It decides whether the remaining waits (17 gaps with compute dispatches, 33 with uniform updates) are worth work. The per-gap dump is read before anything is built.
-2. A cost table per feature of the game (which compute step and which pass costs how much), from the dump and the names read in the game's code. It shows where less GPU work is possible.
-3. Play tests for stability with the test build, beside the speed work.
-4. Even motion below 60: 60 + 60 frame generation needs the real frame under 16.7 ms first, so it waits for steps 1 and 2.
+1. Play tests for stability with the baseline settings: crashes, picture faults, hitches.
+2. The hitch cause: a play run with no other app on the GPU, and a count of the long frames.
+3. More tests of what the game's code shows, each as a quick switch that is checked against a one-frame dump before it is built.
+4. Even motion: 60 + 60 frame generation needs the real frame under 16.7 ms, so it is parked. 30 + 30 is stable.
 5. Bring the changes of the table into this repository as patches, each with its measurement. Until then, of the settings in the table "Settings used in the test build", the released app shows only Frame rate and Encode thread for this game. Its Upscaling row is a different setting from Game's upscaler.
 
 ## Plan for reverse engineering
