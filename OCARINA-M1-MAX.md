@@ -100,6 +100,32 @@ Later the same day, from the same data and three more runs:
 
 Not found yet: the cause of the hitches. In play, a hitch is one command buffer that the GPU holds for 20 to 150 ms, with no upload, no new pipeline, no allocator wait and no pattern in the residency numbers. So the cause is not visible from the game or the host. Other apps that use the GPU and swap are suspects, not tested yet.
 
+## Results of 11 and 12 Nov: parallel GPU work
+
+Question: can more of the frame run in parallel on the M1 Max GPU? Measured with Apple's Metal System Trace (5 seconds in the test scene) and in-run A/B tests.
+
+What the trace shows:
+
+- The GPU works about 72 % of the time: vertex 15 %, fragment 34 %, compute 27 %.
+- Two or more of these units work at the same time only about 4 % of the time. The GPU runs the frame's steps one after another.
+- The idle 28 % is mostly short gaps (under 0.1 ms) between steps inside one command buffer, and about 1.2 ms a frame between command buffers.
+- The host's own per-pass timer counts waiting as work. The trace is the reference.
+
+What was tried:
+
+- `DM_NVN_MDX_SEAM`: the gap before the second half of the main pass stays about 1 ms with the switch on. No gain. Off.
+- `DM_NVN_ASYNC_CS` (the async compute window, `experiments/ocarina-m1-max/04-mdx-seam-and-async-compute.diff`):
+  - It works. With it on, the two full-screen passes after the frame's largest compute group (4 dispatches, about 1.1 ms) start at the same time as that group. With it off, they start after it.
+  - The gain is small. That part of the frame takes 1.445 ms on and 1.467 ms off: the passes run beside the group but slow down from 0.29 to 1.4 ms, because the group and the passes already fill the shader cores.
+  - Trace: time with two or more units busy at once rose from 39.5 to 46.0 ms a second.
+  - A/B, 20 phases of 5 seconds each: frame mean 16.76 ms on, 16.98 ms off. The median sits at the 60 Hz limit in both states.
+  - The picture was correct in screenshots taken while it was on.
+  - The first build did nothing: a block at the end of every command buffer stopped the first compute group of each one. That block is needed only with frame generation on (its MetalFX work is the only compute outside the frame's own command buffers) and now applies only then.
+
+Conclusion: on this GPU, running more work side by side helps little, because each heavy step already keeps the cores busy. The time left to win is the short waits between steps and between command buffers.
+
+Not explained: in one run the frame took 19.3 ms in both A/B states, and in later runs 16.7 ms in both states. The code was the same, so the run conditions changed.
+
 ## The model
 
 1. The frame is a serial chain. The game builds a frame. A host thread translates it (7 to 9.5 ms of CPU). The GPU runs it (15.4 to 20.4 ms from the first start to the last end). The game then waits until the GPU is done before it lets the next frame's commands run. In run B that wait took 3.7 to 11.5 ms a frame.
@@ -115,7 +141,8 @@ Steps 1 and 2 of the earlier plan are done (build 5 measured, GPU overlap stoppe
 2. The hitch cause: a play run with no other app on the GPU, and a count of the long frames.
 3. More tests of what the game's code shows, each as a quick switch that is checked against a one-frame dump before it is built.
 4. Even motion: 60 + 60 frame generation needs the real frame under 16.7 ms, so it is parked. 30 + 30 is stable.
-5. Bring the changes of the table into this repository as patches, each with its measurement. Until then, of the settings in the table "Settings used in the test build", the released app shows only Frame rate and Encode thread for this game. Its Upscaling row is a different setting from Game's upscaler.
+5. Frame rate above 60 (asked 12 Nov): not possible with the current host. The game advances its time by a frame ratio that the host's frame step patch sets from whole vsyncs of 1/60 s, and the host's 120 fps mode refuses a game with such a step. It needs a step in 1/120 s units in the patch and the host, and a check in the game's code that a ratio of 0.5 keeps the game's speed and physics right.
+6. Bring the changes of the table into this repository as patches, each with its measurement. Until then, of the settings in the table "Settings used in the test build", the released app shows only Frame rate and Encode thread for this game. Its Upscaling row is a different setting from Game's upscaler.
 
 ## Plan for reverse engineering
 

@@ -1,0 +1,321 @@
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -1532,6 +1532,38 @@
+ static uint64_t g_seam_why[8];
+ void mtl_seam_why(uint64_t w[8]) { for (int i = 0; i < 8; i++) w[i] = g_seam_why[i]; }
+ static void seam_close(int why) { if (g_seam_ok && seam_on()) g_seam_why[why]++; g_seam_ok = 0; }
++// DM_NVN_ASYNC_CS=1 (default off; ab: alternated with the DM_AB phases; off while DM_NVN_COPY_SEAM is on): a copy encoder that holds only the game's dispatches, each with reads and writes
++// that can be listed (acs_cs), ends with a barrier from its dispatch stage to later dispatches and copies alone, and opens a window with those ranges. Draw passes begun while the window
++// is open do not wait for the dispatch stage (Metal 4 orders encoders on one queue only by barriers), so they run beside the dispatches. A pass whose attachments overlap the window's
++// ranges, or a draw that may read what the dispatches write (any stage, vertex streams, indices, indirect arguments; a binding that cannot be listed counts) or writes memory from a
++// shader, puts the wait for the dispatch stage back and closes the window: each later pass waits for that stage at its begin. The window ends at the full end barrier (m4_end) of an
++// encoder that began waiting for the dispatch stage. Dispatch work with no end barrier (the scaler's MetalFX encoders, other command buffers between segments) closes the window and
++// keeps new ones shut until such a full end barrier (acs_block)
++enum { ACS_RN = 96 };
++#define ACS_NODISP (MTLStageVertex | MTLStageFragment | MTLStageTile | MTLStageObject | MTLStageMesh | MTLStageResourceState | MTLStageBlit | MTLStageAccelerationStructure | MTLStageMachineLearning)   // every stage but the dispatch stage
++typedef struct { uint64_t lo, hi; } acs_rng;
++static acs_rng g_acs_er[ACS_RN], g_acs_ew[ACS_RN], g_acs_wr[ACS_RN], g_acs_ww[ACS_RN];   // the open copy encoder's reads and writes; the window's
++static int g_acs_ner, g_acs_new, g_acs_nwr, g_acs_nww;
++static int g_acs_ok, g_acs_nd;               // the open copy encoder holds only the game's dispatches with listed reads and writes (acs_cs); how many
++static int g_acs_live, g_acs_closed, g_acs_block;
++static void *g_acs_wenc; static int g_acs_wall;   // the open encoder on g_cb whose begin waited for the dispatch stage (wall: for every stage of earlier work)
++static uint64_t g_acs_windows, g_acs_nowait, g_acs_draw_hits, g_acs_rt_hits;   // windows opened, passes begun without the dispatch wait, draws and attachments that closed a window
++static int acs_on(void) { static int m = -1, once; if (m < 0) m = sw_mode("DM_NVN_ASYNC_CS", 0); int on = m && sw_on(m) && !seam_on(); if (on && !once++) MLOG("DM_NVN_ASYNC_CS: groups of the game's compute dispatches run beside the draw passes after them (a pass or draw that may touch what they read or write waits for them)"); return on; }
++static int acs_rt_hit(void);   // the attachments of the pass being opened against the window (enc_r_begin_pass)
++static void acs_close(void) { g_acs_closed |= g_acs_live; }
++static void acs_block(void) { acs_close(); g_acs_block = 1; }
++static int mfx_on(void);   // the MetalFX frame interpolation: its own command buffer runs dispatch-stage work with no end barrier (mfx_present_frame)
++static int acs_union(acs_rng *d, int *nd, const acs_rng *s, int ns) {
++    for (int i = 0; i < ns; i++) { int j = 0; while (j < *nd && (d[j].lo != s[i].lo || d[j].hi != s[i].hi)) j++;
++        if (j < *nd) continue; if (*nd >= ACS_RN) return 0; d[(*nd)++] = s[i]; }
++    return 1;
++}
++static void acs_open_window(void) {
++    if (!g_acs_live) { memcpy(g_acs_wr, g_acs_er, sizeof(acs_rng) * (size_t)g_acs_ner); memcpy(g_acs_ww, g_acs_ew, sizeof(acs_rng) * (size_t)g_acs_new); g_acs_nwr = g_acs_ner; g_acs_nww = g_acs_new; g_acs_live = 1; g_acs_closed = 0; }
++    else if (!acs_union(g_acs_wr, &g_acs_nwr, g_acs_er, g_acs_ner) || !acs_union(g_acs_ww, &g_acs_nww, g_acs_ew, g_acs_new)) g_acs_closed = 1;   // the window's earlier dispatches may still run beside later passes: they stay listed
++    if (++g_acs_windows % 3600 == 0) MLOG("async compute (DM_NVN_ASYNC_CS): %llu windows, %llu passes begun without the dispatch wait, closed by %llu draws and %llu attachments",
++                                          (unsigned long long)g_acs_windows, (unsigned long long)g_acs_nowait, (unsigned long long)g_acs_draw_hits, (unsigned long long)g_acs_rt_hits);
++}
+ static inline void m4_end(id e) {
+     gp_end(e);
+     static int end_alias = -1; if (end_alias < 0) end_alias = sw_mode("DM_NVN_END_ALIAS", 0);
+@@ -1539,8 +1571,12 @@
+     int seam = e == g_blit && g_seam_ok && g_seam_copies > 0 && g_seam_from_relaxed && [e conformsToProtocol:@protocol(MTL4CommandEncoder)] && seam_on();   // a copy encoder of texture-to-texture copies alone, opened after a draw pass that ended relaxed (DM_NVN_COPY_SEAM)
+     if (e == g_blit && !seam && seam_on()) g_seam_why[!g_seam_copies ? 0 : !g_seam_from_relaxed ? 1 : 2]++;   // counted only (mtl_seam_why)
+     if (e != g_blit) seam_close(7);   // any other encoder writes memory the seam set does not list
++    int acs_wd = g_acs_wenc && g_acs_wenc == (__bridge void *)e, acs_wall = acs_wd && g_acs_wall; if (acs_wd) g_acs_wenc = NULL;   // DM_NVN_ASYNC_CS: this encoder's begin waited for the dispatch stage
++    int acs = e == g_blit && !seam && g_acs_ok && g_acs_nd > 0 && !g_acs_block && [e conformsToProtocol:@protocol(MTL4CommandEncoder)] && acs_on();   // a copy encoder of listed game dispatches alone
+     if (seam) { [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageFragment | MTLStageDispatch | MTLStageBlit visibilityOptions:vis]; g_seam_live = 1; }   // the vertex, object and mesh work of every later encoder does not wait for these copies, until the next full end barrier below (enc_r_begin_pass, seam_draw)
++    else if (acs) { [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageDispatch beforeQueueStages:MTLStageDispatch | MTLStageBlit visibilityOptions:vis]; acs_open_window(); }   // later compute and copies wait for these dispatches; draw passes only when the window says so (enc_r_begin_pass, acs_draw)
+     else if ([e conformsToProtocol:@protocol(MTL4CommandEncoder)]) { [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:vis];
++        if (acs_wd) { g_acs_live = g_acs_closed = 0; g_acs_nwr = g_acs_nww = 0; if (acs_wall) g_acs_block = 0; }   // DM_NVN_ASYNC_CS: all later work waits for this encoder, which waited for the window's dispatches (for everything before it, with acs_wall)
+         g_seam_live = 0; if (seam_on()) { g_seam_n = 0; g_seam_ok = 1; } }   // all later work waits for this encoder, which waited for everything before it (its fragment stage at least, for a draw pass): the seam set starts again
+     g_seam_pending = seam;
+     [e endEncoding]; g_last_end_relaxed = 0; g_end_heap = 0; cm_enc_mark(-1);
+@@ -1650,25 +1686,31 @@
+ }
+ static inline id<MTL4RenderCommandEncoder> enc_r_begin_pass(MTL4RenderPassDescriptor *d) { g_cm_enc++; cm_enc_mark(2);   // the draw passes (rp_begin_ex); see barrier_game
+     id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d]; cm_enc_mark(0);
++    if (g_acs_live && !g_acs_closed && acs_rt_hit()) { g_acs_closed = 1; g_acs_rt_hits++; }   // DM_NVN_ASYNC_CS: the pass's attachments overlap the window's ranges, or cannot be listed
++    int acs_go = g_acs_live && !g_acs_closed, acs_waited = 0, acs_all = 0;   // this pass begins without waiting for the window's dispatches
+     int seam = g_seam_pending && g_seam_ok && barrier_game() && bar_heap_ok() && !(g_game_barrier & NVN_BARRIER_ORDER_INDIRECT_DATA_BIT) && seam_on();   // after a copy encoder of texture-to-texture copies alone (m4_end)
+     if (seam) { [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageFragment visibilityOptions:resource_vis()]; g_seam_skip++; g_seam_pass_safe = 0; }   // the fragment stage waits for everything; the stages before it wait only when a draw needs it (seam_draw)
+     else if (g_last_end_relaxed && !bar_game_full() && barrier_game() && bar_heap_ok()) { g_bar_skip++; g_seam_pass_safe = 0; }
+-    else { [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()]; g_bar_full++; g_bar_why[!barrier_game() ? 3 : !g_last_end_relaxed ? (g_end_heap ? 2 : 0) : bar_game_full() ? 1 : 2]++; g_seam_pass_safe = 1; }   // safe: all of this pass's stages wait (later passes' do not: the seam set stays until a full end barrier, m4_end)
++    else { [e barrierAfterQueueStages:acs_go ? ACS_NODISP : MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()]; g_bar_full++; acs_waited = acs_all = !acs_go; g_bar_why[!barrier_game() ? 3 : !g_last_end_relaxed ? (g_end_heap ? 2 : 0) : bar_game_full() ? 1 : 2]++; g_seam_pass_safe = 1; }   // safe: all of this pass's stages wait (later passes' do not: the seam set stays until a full end barrier, m4_end)
+     g_seam_pending = 0; g_seam_copies = 0;
+     if (seam_on()) seam_rt_add(); else g_seam_ok = 0;   // this pass's attachments are written from here on; with the switch off the set is not kept, so no seam until the next full end barrier with it on
+     if (g_seam_live && !g_seam_pass_safe && !g_seam_ok) { [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageVertex | MTLStageObject | MTLStageMesh visibilityOptions:resource_vis()]; g_seam_pass_safe = 1; }   // copies are still unordered before vertex work and the set cannot tell what a draw may read: this pass waits whole
++    if (g_acs_live && !acs_go && !acs_waited) { [e barrierAfterQueueStages:MTLStageDispatch beforeStages:MTLStageVertex | MTLStageObject | MTLStageMesh | MTLStageFragment visibilityOptions:resource_vis()]; acs_waited = 1; }   // DM_NVN_ASYNC_CS: the window is closed: the relaxed or seam path waits for the dispatch stage too
++    if (acs_go) g_acs_nowait++;
++    g_acs_wenc = acs_waited ? (__bridge void *)e : NULL; g_acs_wall = acs_all;
+     g_game_barrier = 0;
+     [e setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [e setArgumentTable:g_ft atStages:MTLRenderStageFragment]; gp_begin(e, 'R', d); return e;
+ }
++static int g_end_nodisp;   // DM_NVN_MDX_SEAM: the pass that ends now is split for the multi-draw masking job, which must not wait for its fragments: its end barrier leaves out the dispatch stage (every compute encoder but that job's begins with the full wait)
+ static inline void enc_r_end_pass(id e) {
+     g_seam_copies = 0;   // DM_NVN_COPY_SEAM: copies are counted from here
+     if (!barrier_game() || !bar_heap_ok()) { m4_end(e); g_end_heap = barrier_game(); return; }
+     // Object and mesh stages on both sides: a mesh pipeline's pass ends after its task and mesh work as well, and the next pass's task and mesh shaders wait for this pass's fragments
+     // (without them they could start before those fragments were done, as an iPhone run of Ocarina of Time showed)
+-    gp_end(e); [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageVertex | MTLStageObject | MTLStageMesh | MTLStageFragment beforeQueueStages:MTLStageObject | MTLStageMesh | MTLStageFragment | MTLStageDispatch | MTLStageBlit visibilityOptions:resource_vis()];
+-    [e endEncoding]; g_last_end_relaxed = 1;
++    gp_end(e); [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageVertex | MTLStageObject | MTLStageMesh | MTLStageFragment beforeQueueStages:MTLStageObject | MTLStageMesh | MTLStageFragment | (g_end_nodisp ? (MTLStages)0 : MTLStageDispatch) | MTLStageBlit visibilityOptions:resource_vis()];
++    [e endEncoding]; g_last_end_relaxed = 1; if (g_acs_wenc == (__bridge void *)e) g_acs_wenc = NULL;
+ }
+-static inline id<MTL4RenderCommandEncoder> enc_r_begin(MTL4RenderPassDescriptor *d) { g_cm_enc++; cm_enc_mark(2); id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d]; cm_enc_mark(0); [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()]; [e setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [e setArgumentTable:g_ft atStages:MTLRenderStageFragment]; gp_begin(e, 'R', d); return e; }
++static inline id<MTL4RenderCommandEncoder> enc_r_begin(MTL4RenderPassDescriptor *d) { g_cm_enc++; cm_enc_mark(2); id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d]; cm_enc_mark(0); [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()]; g_acs_wenc = (__bridge void *)e; g_acs_wall = 1; [e setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [e setArgumentTable:g_ft atStages:MTLRenderStageFragment]; gp_begin(e, 'R', d); return e; }
+ static inline void enc_r_end(id e) { m4_end(e); }
+ static inline void enc_r_pso(id<MTL4RenderCommandEncoder> e, id<MTLRenderPipelineState> p) { [e setRenderPipelineState:p]; }
+ static inline void enc_r_dss(id<MTL4RenderCommandEncoder> e, id<MTLDepthStencilState> s) { [e setDepthStencilState:s]; }
+@@ -1699,9 +1741,29 @@
+ static inline void enc_r_draw_indexed(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger n, MTLIndexType t, uint64_t gpu, NSUInteger len, NSUInteger i, NSInteger bv, NSUInteger bi) { g_cm_mdraws++; [e drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:gpu indexBufferLength:len instanceCount:i baseVertex:bv baseInstance:bi]; }
+ static inline void enc_r_draw_indexed_indirect(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, MTLIndexType t, uint64_t gpu, NSUInteger len, uint64_t ind) { g_cm_mdraws++; [e drawIndexedPrimitives:p indexType:t indexBuffer:gpu indexBufferLength:len indirectBuffer:ind]; }
+ static void ubd_land_compute(void);
+-static inline id<MTL4ComputeCommandEncoder> enc_c_begin(MTLComputePassDescriptor *d) { g_cm_enc++; (void)d; ubd_land_compute(); cm_enc_mark(3); id<MTL4ComputeCommandEncoder> e = [g_cb computeCommandEncoder]; cm_enc_mark(1); [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()]; [e setArgumentTable:g_ct]; gp_begin(e, 'C', nil); return e; }
++static inline id<MTL4ComputeCommandEncoder> enc_c_begin(MTLComputePassDescriptor *d) { g_cm_enc++; (void)d; ubd_land_compute(); cm_enc_mark(3); id<MTL4ComputeCommandEncoder> e = [g_cb computeCommandEncoder]; cm_enc_mark(1); [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()]; g_acs_wenc = (__bridge void *)e; g_acs_wall = 1; [e setArgumentTable:g_ct]; gp_begin(e, 'C', nil); return e; }
+ static inline id<MTLComputeCommandEncoder> enc_c_begin_concurrent(id<MTLCommandBuffer> cb) { return [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]; }
+ static inline void enc_c_end(id e) { m4_end(e); }
++// DM_NVN_MDX_SEAM=1 (default off; ab: alternated with the DM_AB phases): the indirect-count multi-draw masking job (mdx_run) that splits an open draw pass reads only records and
++// counts that earlier compute dispatches and copies wrote (a pass whose draws wrote memory from a shader keeps the full barriers). Its encoder waits for those stages alone and ends
++// with a barrier from its dispatch stage to all later work, and the second half of the pass begins on the relaxed path: its vertex work overlaps the first half's fragments, as at
++// any other relaxed seam. Ocarina of Time splits its main scene pass this way every frame; the second half's vertex work (about 1 ms on an M1 Max) waited for the first half whole
++static int mdx_seam_on(void) { static int m = -1, once; if (m < 0) m = sw_mode("DM_NVN_MDX_SEAM", 0); int on = m && sw_on(m); if (on && !once++) MLOG("DM_NVN_MDX_SEAM: the multi-draw masking job that splits a draw pass waits for compute and copies alone; the second half of the pass begins on the relaxed path"); return on; }
++static uint64_t g_mdx_light;   // masking jobs encoded with the light barriers
++static id<MTL4ComputeCommandEncoder> enc_c_begin_mdx(int *light) {   // enc_c_begin, with the light wait when *light holds and nothing but the split pass ended since
++    g_cm_enc++; ubd_land_compute(); if (!g_last_end_relaxed) *light = 0;
++    cm_enc_mark(3); id<MTL4ComputeCommandEncoder> e = [g_cb computeCommandEncoder]; cm_enc_mark(1);
++    if (*light) [e barrierAfterQueueStages:MTLStageDispatch | MTLStageBlit beforeStages:MTLStageDispatch visibilityOptions:resource_vis()];
++    else [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()];
++    g_acs_wenc = (__bridge void *)e; g_acs_wall = !*light;   // DM_NVN_ASYNC_CS: both waits include the dispatch stage
++    [e setArgumentTable:g_ct]; gp_begin(e, 'C', nil); return e;
++}
++static void enc_c_end_mdx(id e, int light) {   // m4_end, or the light end: later work waits for this job's dispatch stage, and the next draw pass may begin relaxed
++    if (!light) { m4_end(e); return; }
++    gp_end(e); seam_close(7); g_seam_pending = 0;
++    [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageDispatch beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
++    [e endEncoding]; g_end_heap = 0; cm_enc_mark(-1); g_last_end_relaxed = 1; g_mdx_light++; if (g_acs_wenc == (__bridge void *)e) g_acs_wenc = NULL;
++}
+ static inline void enc_c_pso(id e, id<MTLComputePipelineState> p) { [e setComputePipelineState:p]; }
+ static inline void enc_c_args(id e, uint64_t gpu, NSUInteger i) { (void)e; if (rec_on()) rec_table_op(RO_T_ADDR, g_ct, gpu, i); else [g_ct setAddress:gpu atIndex:i]; }
+ static inline void enc_c_dispatch(id e, MTLSize n, MTLSize t) { [e dispatchThreadgroups:n threadsPerThreadgroup:t]; }
+@@ -1733,13 +1795,15 @@
+ uint64_t mtl_blit_splits(void) { return g_blit_splits; }
+ static int enc_open(void);
+ static int g_blit_ct;   // the open copy encoder has the compute argument table set (dispatches share it, dispatch_enc)
+-static id<MTL4ComputeCommandEncoder> blit_open(void) { if (!g_blit) { ser_gate(); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:blit_vis()]; gp_begin(g_blit, 'C', nil); g_bw_n = g_br_n = 0; g_blit_ops = 0; g_blit_ct = 0; g_seam_from_relaxed = g_last_end_relaxed; } return g_blit; }   // g_seam_from_relaxed: the encoder before this one was a draw pass that ended relaxed (m4_end)
++static id<MTL4ComputeCommandEncoder> blit_open(void) { if (!g_blit) { ser_gate(); g_blit = enc_b_begin(g_cb); [g_blit barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:blit_vis()]; gp_begin(g_blit, 'C', nil); g_bw_n = g_br_n = 0; g_blit_ops = 0; g_blit_ct = 0; g_seam_from_relaxed = g_last_end_relaxed;
++    g_acs_ok = 1; g_acs_nd = g_acs_ner = g_acs_new = 0; g_acs_wenc = (__bridge void *)g_blit; g_acs_wall = 1; } return g_blit; }   // DM_NVN_ASYNC_CS: eligible until something but a listed game dispatch goes in   // g_seam_from_relaxed: the encoder before this one was a draw pass that ended relaxed (m4_end)
+ static void ubd_flush(void); static int g_nubd;   // the inline updates deferred (see mtl_sub_update)
+ static int g_ubd_landing;
+ static id<MTL4ComputeCommandEncoder> blit_raw(void) {
+     int t2t = g_seam_t2t; g_seam_t2t = 0;   // copies that ending the pass or landing the deferred updates below put in this encoder are not the caller's texture-to-texture copy
+     if (!t2t || (g_nubd && !g_ubd_landing)) seam_close(3);   // DM_NVN_COPY_SEAM: this encoder holds something other than the game's texture-to-texture copies (an upload, a fill, a readback, a deferred inline update)
+     blit_note(); if (enc_open()) g_blit_splits++; rp_end(); id<MTL4ComputeCommandEncoder> e = blit_open();
++    g_acs_ok = 0;   // DM_NVN_ASYNC_CS: a copy, fill or update in this encoder (the copy recorders and ubd_flush come through here)
+     if (g_nubd && !g_ubd_landing) { g_ubd_landing = 1; ubd_flush(); g_ubd_landing = 0; }   // deferred inline updates come before this copy or dispatch in command order
+     return e;
+ }
+@@ -2481,7 +2545,7 @@
+     res_commit();
+     if (g_gp_state == 1 && !gp_active()) { int gn = g_gp_n; gp_lab *gl = malloc(sizeof(gp_lab) * (gn ? gn : 1)); memcpy(gl, g_gp_lab, sizeof(gp_lab) * gn); uint64_t gf = g_gp_frame; g_gp_state = 2; atomic_store(&g_gp_busy, 1);
+         [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)f; gp_report(gn, gl, gf); }]; }
+-    [g_cb endCommandBuffer];
++    if (mfx_on()) acs_block(); [g_cb endCommandBuffer];   // DM_NVN_ASYNC_CS: the other command buffers on the queue hold copies and draw passes, which a pass waits for without the window; only the MetalFX interpolation adds dispatch work with no end barrier
+     rec_commit(g_cb, o);
+     if (!lost_test) rec_signal(g_ev, fence);
+     rec_drain();
+@@ -13259,7 +13323,7 @@
+     rp_end(); ubd_land();
+     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+     up_flush(); res_commit();
+-    [g_cb endCommandBuffer];
++    if (mfx_on()) acs_block(); [g_cb endCommandBuffer];   // DM_NVN_ASYNC_CS: the other command buffers on the queue hold copies and draw passes, which a pass waits for without the window; only the MetalFX interpolation adds dispatch work with no end barrier
+     rec_commit(g_cb, nil);
+     if (!g_mdi_ev) g_mdi_ev = [g_dev newSharedEvent];
+     rec_signal(g_mdi_ev, ++g_mdi_v); rec_drain();
+@@ -13342,8 +13406,11 @@
+     }
+     #undef MDX_TAKE
+     if (!nq) return;
+-    if (g_enc) { g_mdx_splits++; PD("M %llu indirect-count multi-draw masking: render pass split here", g_stat_pass); rp_end(); }
+-    if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
++    int light = 0;   // DM_NVN_MDX_SEAM: the light barriers, when the split pass's draws wrote no memory from a shader and it ended relaxed
++    if (g_enc) { g_mdx_splits++; light = mdx_seam_on() && !seam_on() && !g_pass_swrite;
++        PD("M %llu indirect-count multi-draw masking: render pass split here%s", g_stat_pass, light ? " (light barriers)" : "");
++        g_end_nodisp = light; rp_end(); g_end_nodisp = 0; light = light && g_last_end_relaxed; }
++    if (g_blit) { enc_b_end(g_blit); g_blit = nil; light = 0; }
+     typedef struct { uint64_t rec, cnt, out; uint32_t i, words; } mjob;
+     int nj = (nq + 63) & ~63;
+     id<MTLBuffer> ab; size_t ao = arena_alloc((size_t)nj * sizeof(mjob) + (size_t)nq * 32, &ab);   // the jobs (padded to whole threadgroups), then the copies 32 bytes apart
+@@ -13352,14 +13419,14 @@
+     for (int k = 0; k < nq; k++) { mdx_ent *e = q[k].e; void *mb; uint64_t mo, rg, cg;
+         if (!mtl_gpu_addr(e->ind, 4 * (q[k].words ? q[k].words : 2), &mb, &mo, &rg) || !mtl_gpu_addr(e->cnt, 4, &mb, &mo, &cg)) continue;
+         e->out = og + 32 * (uint64_t)k; j[k] = (mjob){rg, cg, e->out, q[k].i, q[k].words}; }
+-    id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL); [ce setArgumentTable:at]; [at setAddress:ab.gpuAddress + ao atIndex:0]; [ce setComputePipelineState:ps];
++    id<MTL4ComputeCommandEncoder> ce = enc_c_begin_mdx(&light); [ce setArgumentTable:at]; [at setAddress:ab.gpuAddress + ao atIndex:0]; [ce setComputePipelineState:ps];
+     [ce dispatchThreadgroups:MTLSizeMake((NSUInteger)nj / 64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+-    enc_c_end(ce);
++    enc_c_end_mdx(ce, light);
+     args_dirty_all();
+     g_mdx_draws += (uint64_t)nq;
+     if (!g_mdx_runs++) MLOG("indirect-count multi-draw masking: first time, %d draws (their records are copied on the GPU, zeros past the count, before the render pass)", nq);
+-    else if (g_mdx_runs % 3600 == 0) MLOG("indirect-count multi-draw masking: %llu times, %llu draws (%llu encoded alone, mdx_next), render pass split %llu times; waits for the GPU-written count %llu",
+-                                          (unsigned long long)g_mdx_runs, (unsigned long long)g_mdx_draws, (unsigned long long)g_mdx_fast, (unsigned long long)g_mdx_splits, (unsigned long long)g_mdi_waits);
++    else if (g_mdx_runs % 3600 == 0) MLOG("indirect-count multi-draw masking: %llu times, %llu draws (%llu encoded alone, mdx_next), render pass split %llu times; waits for the GPU-written count %llu, light barriers %llu (DM_NVN_MDX_SEAM)",
++                                          (unsigned long long)g_mdx_runs, (unsigned long long)g_mdx_draws, (unsigned long long)g_mdx_fast, (unsigned long long)g_mdx_splits, (unsigned long long)g_mdi_waits, (unsigned long long)g_mdx_light);
+ }
+ // The draws of one multi-draw are recorded back to back with the same state, and only the first few are live: each one replayed right after the one before it (no op between them,
+ // the same open pass) is encoded alone, without the rest of draw's work, which cost a whole draw for each masked one (about 1.5 µs on an M4 Pro, 1,100 a frame in Kamura Village)
+@@ -13595,7 +13662,72 @@
+     [g_enc barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageVertex | MTLStageObject | MTLStageMesh visibilityOptions:resource_vis()];   // this draw and the pass's later ones wait for the copies whole, as the full barrier would have made them; later passes are checked again (g_seam_live stays)
+     g_seam_pass_safe = 1; g_seam_back++;
+     PD("M %llu copy seam: a draw reads GPU-written memory before its fragment stage; vertex barrier put back", g_stat_pass);
++}
++// DM_NVN_ASYNC_CS (see acs_on): ranges into a window-sized set, as csh_add (0: not listable, or the set is full); and whether a range may overlap a set (1 when it cannot be listed)
++static int acs_add(acs_rng *r, int *n, uint64_t a, uint64_t sz) {
++    if (!a) return 1;
++    if (!sz || sz > UINT64_MAX - a || nvn_sparse_alias(a, a + sz)) return 0;
++    for (int i = 0; i < *n; i++) if (r[i].lo == a && r[i].hi == a + sz) return 1;
++    if (*n >= ACS_RN) return 0;
++    r[(*n)++] = (acs_rng){a, a + sz}; return 1;
+ }
++static int acs_hit(uint64_t a, uint64_t sz, const acs_rng *r, int n) {
++    if (!a) return 0;
++    if (!sz || sz > UINT64_MAX - a || nvn_sparse_alias(a, a + sz)) return 1;
++    for (int i = 0; i < n; i++) if (a < r[i].hi && r[i].lo < a + sz) return 1;
++    return 0;
++}
++static tex_t acs_tex(int tid) { os_unfair_lock_lock(&g_rmu); tex_t t = tid > 0 && tid < g_ntreg && g_treg[tid].ok ? g_treg[tid].t : (tex_t){0}; os_unfair_lock_unlock(&g_rmu); return t; }
++// One of the game's dispatches going into the copy encoder (S as it is there): its reads and writes join the encoder's sets. Storage buffers written (rw) and storage images are writes;
++// uniform buffers, read-only storage buffers and texture storage are reads. 0 when one cannot be listed (a texture with no pool storage, a binding the sets do not cover, a set full)
++static int acs_cs(NvShader *cs, const p_dispatch *dp) {
++    if (!cs || cs->builtin || dp->ind || cs->rf.bindless || cs->rf.dyn) return 0;
++    for (int i = 0; i < cs->rf.nb; i++) { const nvn_rbind *b = &cs->rf.b[i];
++        switch (b->kind) {
++            case NVN_RB_SBUFP: if (b->reg >= 16) return 0;
++                if (!(b->rw ? acs_add(g_acs_ew, &g_acs_new, S.ssbo[5][b->reg].addr, S.ssbo[5][b->reg].size) : acs_add(g_acs_er, &g_acs_ner, S.ssbo[5][b->reg].addr, S.ssbo[5][b->reg].size))) return 0; break;
++            case NVN_RB_CBUF: case NVN_RB_UBOP: if (b->reg >= 16 || !acs_add(g_acs_er, &g_acs_ner, S.ubo[5][b->reg].addr, S.ubo[5][b->reg].size)) return 0; break;
++            case NVN_RB_IMG: case NVN_RB_IMGU: { if (b->kind == NVN_RB_IMG && b->reg >= 32) return 0;
++                int tid = b->kind == NVN_RB_IMGU ? ubo_tex_id(ubo_handle(5, b->reg, b->off)) : (int)(S.img[5][b->reg] & 0xfffff);   // as seam_dispatch_writes (encode_args) resolves the slot
++                if (!tid) break;   // nothing bound: the writes go to the host's own sink (img_binding)
++                tex_t t = acs_tex(tid); if (!t.serial || !t.mem || !acs_add(g_acs_ew, &g_acs_new, (uint64_t)t.mem, t.L.size)) return 0; break; }
++            case NVN_RB_TEX: case NVN_RB_TBUF: { if (b->kind == NVN_RB_TBUF && b->rw) return 0;
++                uint64_t h = tex_slot_h(S.tex[5], S.img[5], b->reg); int tid = (int)(h & 0xfffff); if (!tid) break;   // as csh_cs
++                tex_t t = acs_tex(tid); if (!t.serial || !t.mem || !acs_add(g_acs_er, &g_acs_ner, (uint64_t)t.mem, t.L.size)) return 0; break; }
++            case NVN_RB_TEXU: case NVN_RB_TEXD: case NVN_RB_TEXA: case NVN_RB_SBUFU: case NVN_RB_GMEM: return 0;   // memory not listed here
++            default: break; } }
++    return 1;
++}
++static int acs_rt_hit(void) {   // the attachments of the pass being opened (R.rt, as seam_rt_add lists them) against the window's reads and writes; one with no pool storage counts
++    for (int k = 0; k < 9; k++) { const tex_t *t = k == 8 ? R.rt.depth : k < R.rt.n ? R.rt.color[k] : NULL; if (!t) continue;
++        if (!t->mem || acs_hit((uint64_t)t->mem, t->L.size, g_acs_wr, g_acs_nwr) || acs_hit((uint64_t)t->mem, t->L.size, g_acs_ww, g_acs_nww)) return 1; }
++    return 0;
++}
++// A draw of a pass begun without waiting for the window's dispatches: 1 when it writes memory from a shader or through transform feedback, is an indirect-count multi-draw, or any of
++// its stages (fragment too), vertex streams, indices or indirect arguments may read what the window's dispatches write, or reads something that cannot be listed (seam_draw_hit, all stages)
++static int acs_draw_hit(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
++    if (!pr || (dw && dw->mdi_cnt) || (di && di->mdi_cnt) || S.tf_on || prog_swrites(pr)) return 1;
++    for (int k = 0; k < 16; k++) if (S.vbuf[k].size && acs_hit(S.vbuf[k].address, S.vbuf[k].size, g_acs_ww, g_acs_nww)) return 1;
++    if (di && acs_hit(di->ibuf, (uint64_t)(di->count > 0 ? di->count : 0) * 4 + 16, g_acs_ww, g_acs_nww)) return 1;
++    if (acs_hit(dw ? dw->ind : di ? di->ind : 0, 32, g_acs_ww, g_acs_nww)) return 1;
++    for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh) continue;
++        if (sh->rf.bindless || sh->rf.dyn) return 1;
++        for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i];
++            switch (b->kind) {
++                case NVN_RB_CBUF: case NVN_RB_UBOP: if (b->reg >= 16 || acs_hit(S.ubo[st][b->reg].addr, S.ubo[st][b->reg].size, g_acs_ww, g_acs_nww)) return 1; break;
++                case NVN_RB_SBUFP: if (b->reg >= 16 || acs_hit(S.ssbo[st][b->reg].addr, S.ssbo[st][b->reg].size, g_acs_ww, g_acs_nww)) return 1; break;
++                case NVN_RB_TEX: { uint64_t h = tex_slot_h(S.tex[st], S.img[st], b->reg); int tid = (int)(h & 0xfffff); if (!tid) break;
++                    tex_t t = acs_tex(tid); if (!t.serial || !t.mem || acs_hit((uint64_t)t.mem, t.L.size, g_acs_ww, g_acs_nww)) return 1; break; }
++                case NVN_RB_TEXU: case NVN_RB_TEXD: case NVN_RB_TEXA: case NVN_RB_IMG: case NVN_RB_IMGU: case NVN_RB_TBUF: case NVN_RB_GMEM: case NVN_RB_SBUFU: return 1;   // reads (or writes) memory not listed here
++                default: break; } } }
++    return 0;
++}
++static void acs_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {   // before a draw is encoded (and before a transform feedback capture): the wait for the dispatch stage when it may need it
++    if (!g_acs_live || g_acs_closed || (g_enc && g_acs_wenc == (__bridge void *)g_enc) || !acs_draw_hit(pr, dw, di)) return;
++    if (g_enc) { [g_enc barrierAfterQueueStages:MTLStageDispatch beforeStages:MTLStageVertex | MTLStageObject | MTLStageMesh | MTLStageFragment visibilityOptions:resource_vis()]; g_acs_wenc = (__bridge void *)g_enc; g_acs_wall = 0; }   // this draw and the pass's later ones wait for the dispatches
++    g_acs_closed = 1; g_acs_draw_hits++;   // later passes wait at their begin (enc_r_begin_pass); with no pass open, the next one does
++    PD("M %llu async compute: a draw may read what the window's dispatches write (or writes memory); dispatch barrier put back, window closed", g_stat_pass);
++}
+ // DM_NVN_SEAM_DISPATCH=0: the game's compute dispatches close the copy seam, as before they were accepted (only matters with DM_NVN_COPY_SEAM on)
+ static int seam_disp_on(void) { static int m = -1; if (m < 0) { const char *e = getenv("DM_NVN_SEAM_DISPATCH"); m = !(e && !strcmp(e, "0")); if (!m) MLOG("DM_NVN_SEAM_DISPATCH=0: a compute dispatch between draw passes closes the copy seam"); } return m; }
+ // One of the game's dispatches at its place in the stream (S as it is there): what it writes joins the seam set, its storage buffers (all counted as written, as csh_cs does) and its
+@@ -13838,6 +13970,7 @@
+     __unsafe_unretained NvProg *pr = g_geo_program ? g_geo_program : prog_get(S.prog);
+     image_prepare(pr, 0x1f);
+     draw_gs_check(pr);   // a geometry stage left with no function (see prog_fold_gs)
++    if (!g_geo_program && S.tf_on) acs_draw(pr, dw, di);   // DM_NVN_ASYNC_CS: a transform feedback capture writes memory and does not reach acs_draw below
+     if (!g_geo_program && S.rast_discard && S.tf_on) { tf_draw(pr, dw, di); return; }
+     // Feedback captures rasterized draws too (Donkey Kong Country: Tropical Freeze's fur).
+     if (!g_geo_program && S.tf_on && pr && pr->sh[0] && pr->sh[0]->tf_fn) tf_draw(pr, dw, di);
+@@ -14098,6 +14231,7 @@
+ #endif
+     udc_note_draw(pr, raster_mask);
+     seam_draw(pr, dw, di);   // before this draw is encoded: its vertex, object and mesh work may need the wait the pass began without
++    acs_draw(pr, dw, di);    // DM_NVN_ASYNC_CS: as seam_draw, for the window's dispatches
+     swrite_note(pr); order_note(pr);
+     if (g_mtk.on) { mtk_encode(en); return; }
+     if (g_geo_mesh.on) { geo_mesh_encode(en); return; }
+@@ -14264,6 +14398,7 @@
+ static int dispatch_overlap(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_DISPATCH_OVERLAP"); v = e ? atoi(e) != 0 : DM_GAME_DISPATCH_OVERLAP; if (v) MLOG("dispatch overlap: the game's dispatches with no barrier of its between them run side by side (DM_NVN_DISPATCH_OVERLAP=0 orders each after the one before)"); } return v; }
+ static id<MTL4ComputeCommandEncoder> dispatch_enc(int game) {   // game: one of the game's dispatches (0: the host's own, ordered as a copy is)
+     id<MTL4ComputeCommandEncoder> e = blit_open(); g_gp_disp++;
++    if (!game) g_acs_ok = 0;   // DM_NVN_ASYNC_CS: the host's own dispatch writes memory the window does not list (the game's: dispatch, acs_cs)
+     if (!g_seam_t2t) seam_close(4);   // DM_NVN_COPY_SEAM: a dispatch writes memory the seam set does not list
+     int beside = game && g_blit_ops && g_blit_disponly && !g_cs_gbar && dispatch_overlap();
+     if (g_blit_ops && !beside) blit_barrier();
+@@ -14352,6 +14487,7 @@
+         seam_d = seam_dispatch_writes(cs); g_seam_t2t = seam_d; }
+     id<MTLComputeCommandEncoder> ce = own ? pg_compute() : (id<MTLComputeCommandEncoder>)dispatch_enc(1);
+     g_seam_t2t = 0; g_seam_copies += seam_d;
++    if (!own) { if (acs_on() && acs_cs(cs, dp)) g_acs_nd++; else g_acs_ok = 0; }   // DM_NVN_ASYNC_CS: after dispatch_enc, whose blit_open starts the sets of a new encoder (the indirect dispatch's copy is not listed: acs_cs)
+     PD("X %llu dispatch %s groups %llux%llux%llu%s%s", g_stat_pass, cs->key, (unsigned long long)dp->x, (unsigned long long)dp->y, (unsigned long long)dp->z, dp->ind ? " indirect" : "", own ? " (own encoder)" : g_disp_last_beside ? " beside the one before" : " after a barrier");
+     enc_c_pso(ce, ps);
+     if (tg_groups) {
+@@ -15002,7 +15138,7 @@
+     id<MTL4ComputeCommandEncoder> ce = [g_cb computeCommandEncoder];   // the scaler's encoders come after the frame's work so far: MetalFX opens encoders of its own, which take no barrier
+     [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit visibilityOptions:resource_vis()];
+     [ce barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];
+-    [ce endEncoding]; seam_close(7);   // DM_NVN_COPY_SEAM: the scaler's own encoders write its output with no end barrier, and the seam set does not list it
++    [ce endEncoding]; seam_close(7); acs_block();   // DM_NVN_COPY_SEAM: the scaler's own encoders write its output with no end barrier, and the seam set does not list it; DM_NVN_ASYNC_CS: the next pass's full wait must include their dispatch stage
+     if (@available(macOS 27.0, iOS 27.0, *)) {} else if (c->base[DLSS_COLOR][0] || c->base[DLSS_COLOR][1] || c->base[DLSS_DEPTH][0] || c->base[DLSS_DEPTH][1] || c->base[DLSS_MOTION][0] || c->base[DLSS_MOTION][1] || c->base[DLSS_OUTPUT][0] || c->base[DLSS_OUTPUT][1]) {
+         static int once; if (!once++) MLOG("[RED] DLSS: rectangles away from the origin need macOS / iOS 27's MetalFX; taken from the origin");
+     }
+@@ -15148,7 +15284,7 @@
+     }];
+     gmem_commit_patch();
+     res_commit();
+-    [g_cb endCommandBuffer];
++    if (mfx_on()) acs_block(); [g_cb endCommandBuffer];   // DM_NVN_ASYNC_CS: the other command buffers on the queue hold copies and draw passes, which a pass waits for without the window; only the MetalFX interpolation adds dispatch work with no end barrier
+     rec_commit(g_cb, o);
+     if (rec_on()) rec_publish();   // the segment reaches the encode thread now, not when its block of records fills
+     g_cb = rec_cb_new();
+@@ -16141,7 +16277,7 @@
+         sc.colorTexture = color; sc.outputTexture = result; sc.inputContentWidth = cw; sc.inputContentHeight = ch;
+         [sc encodeToCommandBuffer:cb];
+     });
+-    g_last_end_relaxed = 0; seam_close(7);   // the next pass waits for the scaler whole (enc_r_begin_pass), on the copy seam path too: the scaler does not end through m4_end
++    g_last_end_relaxed = 0; seam_close(7); acs_block();   // the next pass waits for the scaler whole (enc_r_begin_pass), on the copy seam path too: the scaler does not end through m4_end
+     if (!direct && !copy_t2t_draw(e->read, out, 0, 0, 0, 0, &at0o, &orr, 0, 0)) {
+         args_dirty_all(); g_up_mfx_kept++; return 0;   // only the scratch image was scaled; the game's shader can still produce the output
+     }
