@@ -15,7 +15,12 @@ Status on 2026-11-11. This page describes a private test tree, not the released 
 | 11 Nov, run B | mean 18.7 ms, blocks of 300 frames from 16.7 to 20.9 ms | 53 | run log |
 | 11 Nov, Render scale 0.75 | not logged | 40 to 56 | the tester read the HUD, and the log of that run was lost |
 
-60 frames a second needs 16.7 ms. The game does not hold it yet. Two faults remain:
+| 11 Nov, build 5, Render scale 1.0 | mean 18.4 ms over 3,600 frames | 54 | run log |
+| 11 Nov, build 5, Render scale 0.75 | 16.7 to 17.4 ms in five blocks of 300 frames, about 25 s of play | 60 | run log |
+
+Build 5 is the test tree with pull request 1929, the early depth tests and the shared command allocator. The table "What the test tree holds" lists them.
+
+60 frames a second needs 16.7 ms. At the game's own resolution the game does not hold it yet. Two faults remain:
 
 - Hitches of 95 to 204 ms, a few each minute.
 - Uneven motion below 60. The game moves in whole steps of 1/60 s. A late frame is paid back later by a double step. In run B 514 of 1,800 frames took a double step, and each was shown about as long as a single one. The average speed is right (1.000 of real time), but the motion speeds up and slows down. After a hitch the debt is paid as a burst, which looks like fast forward.
@@ -37,8 +42,12 @@ Frame generation is in the test build and is not ready:
 - 30 + 30 holds the game at 30 and MetalFX makes one frame between two. On the adapter in High Power the tester called it "amazing". It has no logged numbers. It seems to turn off during talk with a character, and the cause is not known.
 - Uncapped, one logged run on 10 Nov at a 1080p output: real frames fell from about 41 to between 32 and 36 a second, 65 to 72 were shown, and MetalFX cost 4.1 ms a frame. The tester saw 70 to 80 on the HUD and said it was not smooth and had some input lag.
 - Open faults from the first runs: the picture shakes at the border between the scene and the HUD, and some generated frames show ghosts.
-- With frame generation on the encode thread is off, so Encode ahead does nothing there.
-- Since 11 Nov the Uncapped mode also holds late frames, so the game steps evenly at 60 or 30. This is not tested yet.
+- Since 11 Nov the Uncapped mode also holds late frames, so the game steps evenly at 60 or 30.
+- Since 11 Nov frame generation runs with the encode thread. One run: 300 of 300 frames interpolated, no generated frame dropped, clean exit. MetalFX cost 3.7 to 3.8 ms a frame there.
+- Uncapped at Render scale 1.0 (build 5): the game fell to 31 real frames a second and the tester saw ghosts. The generated frame costs GPU time, and the real frame was already at the limit.
+- Uncapped at Render scale 0.75 with the encode thread: 60 real frames were not held. Six tries at a hold of one refresh failed with a real frame of 17.0 to 19.4 ms, and it fell back to 30 + 30.
+- MetalFX makes one frame between two real frames. On a fixed 120 Hz link only 60 + 60 and 30 + 30 give even spacing.
+- The tester rejected Render scale 0.75 as the answer: the picture is visibly softer. The target is the game's own resolution.
 
 ## What the test tree holds
 
@@ -52,12 +61,33 @@ Frame generation is in the test build and is not ready:
 | Render scale for this game | upstream pull request 1903, open | no | 40 to 56 frames a second at 0.75 by the tester, no log |
 | Border corrections compiled out of pipelines that do not need them | upstream pull request 1929, closed | no | not measured here. Upstream reports 1.8 ms less on an M4 Air |
 | Early depth tests from the shader's own flag | upstream commit `a888e668` | yes | not measured here |
-| One command allocator shared by a frame's submissions | upstream commit `fd8188c9` | no | not run yet. It is the candidate fix for the hitches |
+| One command allocator shared by a frame's submissions | upstream commit `fd8188c9` | no | in build 5: no allocator wait, and hitches remain (2 in 3,600 frames). So the allocator pool was not their cause |
 | Encode ahead (`DM_NVN_PREENCODE`) | written in the test tree | no | part of the gain from 28.0 to 18.7 ms, not separated |
 | Frame generation (`DM_MFX_INTERP`) | adapted from MacNativeGames (MIT license) | no | one logged run of the Uncapped mode, see "Settings used in the test build". Not ready |
-| GPU overlap (`DM_NVN_SYNC_LAG`) | written in the test tree, experiment only | no | the game's wait fell from 11.6 ms to between 0.8 and 3.4 ms, and the picture flashed |
+| GPU overlap (`DM_NVN_SYNC_LAG`) | written in the test tree, experiment only | no | build 5 at Render scale 1.0: 18.1 ms against 18.4 ms, and the picture flashed. Stopped: the gain is under the 1.5 ms gate |
+| Frame generation with the encode thread | written in the test tree | no | see "Settings used in the test build" |
+| Copy seam switch (`DM_NVN_COPY_SEAM`, off by default) | written in the test tree, experiment only | no | never acted in the test run. See "Results of 11 Nov" |
 
-What did not help, each measured: fewer or merged submissions, the encode thread on or off, and the GPU clock held at its top frequency.
+What did not help, each measured: fewer or merged submissions, the encode thread on or off, the GPU clock held at its top frequency, GPU overlap, and the copy seam switch.
+
+The changes written in the test tree on 11 Nov are in [`experiments/ocarina-m1-max`](experiments/ocarina-m1-max/README.md) as diff files. They do not apply to this repository's engine pin.
+
+## Results of 11 Nov (build 5, the game's own resolution)
+
+Where the GPU time of one frame goes, from the host's per-pass profile of four frames:
+
+- The CPU has encoded the frame after 7.6 ms. The GPU ends it after 15.9 ms and works the whole time. The GPU is the limit.
+- The frame has about 110 draw passes and about 30 compute or copy steps. The per-pass timer starts after a pass's vertex stage. 11.4 ms lie inside the timers, and 4.5 ms lie before passes start. That part is most likely vertex and mesh work that waits for earlier work. Upstream's trace on an M4 Pro shows the same split.
+- About 30 draw passes a frame start behind a full wait: about 25 after a compute or copy step, about 5 after a barrier of the game. The other 80 start without it.
+- Read in the game's code: after every compute dispatch and every texture copy the game asks that later vertex work waits. It is one generic pattern of the engine. So these waits are the game's request, and the host may drop one only with its own proof that the next pass does not read what was written.
+
+The copy seam switch tried that for passes that follow only texture copies. It failed:
+
+- In the test run it never acted. A dump of one frame shows why: the game makes 2 texture copies a frame, and of 99 gaps between passes only 1 holds nothing but a copy. 50 hold only barriers and state changes, 33 hold uniform data updates, and 17 hold compute dispatches.
+- The assumption behind the switch (most copy steps between passes are texture copies) was not checked against such a dump before the switch was built.
+- The same run compared "every pass waits" with the normal state: 18.4 ms against 17.5 ms as the median of 15 phases each. Two states that ran identical code differed by 1.0 ms, and the scene moved during the run. So this run does not show whether overlap of vertex and fragment work shortens the frame on this GPU.
+
+Not found yet: the cause of the hitches. In two hitch frames the usual amount of work took 85 and 159 ms on the GPU, with no upload, no new pipeline and no allocator wait. A diagnostic line for such command buffers is in the test tree.
 
 ## The model
 
@@ -68,10 +98,12 @@ What did not help, each measured: fewer or merged submissions, the encode thread
 
 ## Next steps
 
-1. Run the new test build with the settings above and read the log: hitches, allocator waits, frame time.
-2. Run it once more with GPU overlap on, and ignore the flashing. The plan is to stop the overlap work if the frame time does not fall by 1.5 ms or more. A smaller result is inside the noise of single runs.
-3. If it does fall: copy the bytes the GPU will read at the moment the game submits, so the game can run one frame ahead without flashing. MacNativeGames does this for Tears of the Kingdom.
-4. Even motion below 60: a steady 40 frames a second on the 120 Hz screen (each frame shown for three refreshes), or frame generation.
+Steps 1 and 2 of the earlier plan are done (build 5 measured, GPU overlap stopped). What is next:
+
+1. A clean run of two states in a fixed scene: every pass waits, and the normal state. It decides whether the remaining waits (17 gaps with compute dispatches, 33 with uniform updates) are worth work. The per-gap dump is read before anything is built.
+2. A cost table per feature of the game (which compute step and which pass costs how much), from the dump and the names read in the game's code. It shows where less GPU work is possible.
+3. Play tests for stability with the test build, beside the speed work.
+4. Even motion below 60: 60 + 60 frame generation needs the real frame under 16.7 ms first, so it waits for steps 1 and 2.
 5. Bring the changes of the table into this repository as patches, each with its measurement. Until then, of the settings in the table "Settings used in the test build", the released app shows only Frame rate and Encode thread for this game. Its Upscaling row is a different setting from Game's upscaler.
 
 ## Plan for reverse engineering
@@ -85,7 +117,11 @@ What works:
 - The whole game module is too large for the tool's start limit. One function at a time works and takes seconds.
 - So each question is narrowed first with small scans (a table of the game's NVN function pointers, then the call sites of one function), and only the functions that the scans name are decompiled.
 
-Done so far: point 3 of the model. It confirmed a measurement, named its parts, and showed that the game has no usable switch that removes the wait. The one mode that skips it also skips the window.
+Done so far:
+
+- Point 3 of the model. It confirmed a measurement, named its parts, and showed that the game has no usable switch that removes the wait. The one mode that skips it also skips the window.
+- The game keeps two sets of per-frame buffers and one main command buffer.
+- The barrier the game issues after each compute dispatch and texture copy, and the engine features that make texture copies (fog pre-pass depth, soft-edge depth, a shared copy helper for snapshot, picking and exposure). See "Results of 11 Nov".
 
 Planned, in this order, each behind its own gate:
 
