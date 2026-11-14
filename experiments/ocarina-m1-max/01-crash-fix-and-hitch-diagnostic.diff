@@ -1,0 +1,44 @@
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -2374,6 +2392,14 @@
+     pthread_mutex_unlock(&g_gspan_mu);
+ }
+ void mtl_gspan_stats(uint64_t *v) { pthread_mutex_lock(&g_gspan_mu); memcpy(v, g_gspan, sizeof g_gspan); pthread_mutex_unlock(&g_gspan_mu); }
++// local (hitch hunt): one command buffer that the GPU held for 20 ms or longer, one line each, the first 200. A frame's 29 command buffers take 26 ms together, and in a hitch
++// frame the same amount of work took 85 to 159 ms (run 1c, frames 3032 and 4416) with no upload, no new pipeline and no allocator wait. The line names which submission was slow
++static void slowcb_note(uint64_t f, uint64_t fence, double g0, double g1, const char *what) {
++    static _Atomic int n;
++    if (!(g0 > 0) || g1 - g0 < 0.020 || atomic_fetch_add(&n, 1) >= 200) return;
++    MLOG("[slowcb] frame %llu fence %llu: the GPU held one command buffer for %.1f ms (start %.3f s, end %.3f s): %s", (unsigned long long)f, (unsigned long long)fence,
++         (g1 - g0) * 1e3, gpu_s_guest_ns(g0) / 1e9, gpu_s_guest_ns(g1) / 1e9, what);
++}
+ static _Atomic int g_seg_inflight;   // main command buffers committed and not reported back yet (sub_cut)
+ static void rt_preserve_bound(void);
+ static void queue_program_preserve(void);
+@@ -2412,6 +2438,7 @@
+     int lost_test = gpu_lost_test();
+     [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
+         gpu_tag_done(gpu_f, cb.GPUStartTime, cb.GPUEndTime); gspan_note(cb.GPUStartTime, cb.GPUEndTime);
++        slowcb_note(gpu_f, fence, cb.GPUStartTime, cb.GPUEndTime, cctx.UTF8String);
+         if (ws_on()) ws_fb(fence, cb.GPUEndTime);
+         uint64_t c0 = 0, c1 = 0; if (seg_ts()) { c0 = gpu_s_guest_ns(cb.GPUStartTime); c1 = gpu_s_guest_ns(cb.GPUEndTime); }
+         if (cb.error) { atomic_store(&g_last_commit_error, 1); res_top_once(cb.error); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("[RED] command buffer error details fence=%llu: %s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("[RED] state of the failed submission fence=%llu: %s", (unsigned long long)fence, cctx.UTF8String); MLOG("[RED] command buffer execution error: %s", cb.error.localizedDescription.UTF8String); }
+@@ -8016,6 +8044,10 @@
+                 MTLCompileOptions *o = [MTLCompileOptions new]; o.preserveInvariance = YES;   // as dmsh_build.py's -fpreserve-invariance
+                 NSError *err = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:o error:&err];
+                 id<MTLFunction> f = lib ? [lib newFunctionWithName:name] : nil;
++                // local: a source that declares function constants (dm_border_off since #1929, the only one in the chain's sources) must be specialized before a pipeline takes it,
++                // or Metal's validation aborts ("fragmentFunction main0 cannot be used to build a pipeline state", build 5 on 2026-11-11). An empty set keeps every default
++                // (border corrections live, as before #1929; as shader_load's fn_spec). The copy stays on the MTLDevice path, so the device specializes it here, on this queue
++                if (f.functionConstantsDictionary.count) f = [lib newFunctionWithName:name constantValues:[MTLFunctionConstantValues new] error:&err];
+                 if (f) result = f; else MLOG("[RED] [mfx] fragment shader %s, UI copy (role %d): %s", key, role, err.localizedDescription.UTF8String);
+             } else MLOG("[RED] [mfx] fragment shader %s: colour 0 (%s) cannot be copied to the UI layer; its draws stay out of it", key, type ? type.UTF8String : "none");
+         }
+@@ -15005,6 +15037,7 @@
+     [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
+         atomic_fetch_sub(&g_seg_inflight, 1);
+         gpu_tag_done(f, cb.GPUStartTime, cb.GPUEndTime); gspan_note(cb.GPUStartTime, cb.GPUEndTime);
++        { char w[48]; snprintf(w, sizeof w, "segment %u cut from its submission", k); slowcb_note(f, cbs_fence, cb.GPUStartTime, cb.GPUEndTime, w); }
+         if (sc) { if (k < SEG_CLK_N) { atomic_store(&sc->t[k][0], gpu_s_guest_ns(cb.GPUStartTime)); atomic_store(&sc->t[k][1], gpu_s_guest_ns(cb.GPUEndTime)); } seg_clk_put(sc); }
+         if (cb.error) { atomic_store(&g_last_commit_error, 1); static int k; if (k++ < 8) MLOG("[RED] segment command buffer execution error: %s", cb.error.description.UTF8String); res_top_once(cb.error); }
+         char where[64]; snprintf(where, sizeof where, "fence %llu, segment %u", (unsigned long long)cbs_fence, k); cbs_feedback(cbs, cb.error, where);

@@ -1,0 +1,120 @@
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -16309,7 +16309,8 @@
+ // Swapchain texture return: before AcquireTexture gets a texture it waits for the ticket of that texture's previous present to be processed (mtl_present_wait), after which the commands the game draws into it
+ // are necessarily ordered after that blit on the GPU queue.
+ #define PQ 8
+-typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; uint64_t ev_val, snap_v; int interp, interp_shown; double interp_ts; } pq_item;   // interp (frame interpolation): output slot of the frame shown before this one (-1 none); interp_shown: it is up   // snap_v: the snapshot copy this present shows (snap_commit_wait)   // t_in: the time the game handed this frame into the present queue (CACurrentMediaTime); ev_val: see g_ext_ev
++typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; uint64_t ev_val, snap_v; int interp, interp_shown; double interp_ts; uint64_t interp_v; } pq_item;   // interp (frame interpolation): output slot of the frame shown before this one (-1 none); interp_shown: it is up   // snap_v: the snapshot copy this present shows (snap_commit_wait)   // t_in: the time the game handed this frame into the present queue (CACurrentMediaTime); ev_val: see g_ext_ev   // interp_v: the note value of the interpolated frame's command buffer (0 = committed directly)
++static _Atomic uint64_t g_mfx_cmt;   // encode thread: the newest interpolation command buffer that reached the queue (a note); see mfx_present_frame
+ // External producer (the Vulkan layer, dm/gfx/vk) renders on its own queue and signals this event when a frame's rendering is done: the present of that frame waits for the value on g_q4
+ static id<MTLSharedEvent> g_ext_ev;
+ static void ext_wait(uint64_t v) { if (v && g_ext_ev) [g_q4 waitForEvent:g_ext_ev value:v]; }
+@@ -16378,8 +16379,9 @@
+     pq_item *fp = &g_pq[(first - 1) % PQ]; int behind = 0;
+     if (fp->interp >= 0 && fp->interp_shown) ticket = first;
+     else if (fifo && ticket > first) { behind = ticket - first >= 2; ticket = behind ? g_pq_in - 1 : first; }
+-    pq_item *ip = &g_pq[(ticket - 1) % PQ]; int interp = !behind && ip->interp >= 0 && !ip->interp_shown ? ip->interp : -1;
++    pq_item *ip = &g_pq[(ticket - 1) % PQ]; int late = ip->interp >= 0 && atomic_load(&g_mfx_cmt) < ip->interp_v; int interp = !behind && ip->interp >= 0 && !ip->interp_shown && !late ? ip->interp : -1;
+     if (interp >= 0) { ip->interp_shown = 1; ip->interp_ts = update.targetPresentationTimestamp; }
++    if (late && !behind && !ip->interp_shown) { static unsigned n; if (++n <= 3 || n % 100 == 0) MLOG("[mfx] generated picture not shown: its command buffer had not reached the queue (%u so far)", n); }
+     pq_item it = *ip; g_link_it_tin = it.t_in;
+     g_pq_read = interp >= 0 ? ticket - 1 : ticket;
+     if (ticket > first) { g_link_dropped += ticket - first; for (uint64_t k = first; k < ticket; k++) { g_pres[k % PRING] = (pres_ent){k, -1}; mtl_tex_unpin(g_pq[(k-1)%PQ].t.serial); } }   // Old frames merged and dropped are recorded as "not presented", so the present statistics honestly count them as dropped frames
+@@ -16549,7 +16551,7 @@
+         // Frame interpolation: the interpolated frame for at least one refresh (at most half the frame), then the game frame for half the frame. Skipped when a newer
+         // game frame is already queued: two pictures per frame would fall further and further behind
+         pthread_mutex_lock(&g_pq_mu); int behind = g_pq_read < g_pq_in; pthread_mutex_unlock(&g_pq_mu);
+-        int show_interp = it.interp >= 0 && !behind;
++        int show_interp = it.interp >= 0 && !behind && atomic_load(&g_mfx_cmt) >= it.interp_v;
+         if (show_interp) { static double tick; if (!tick) { int hz = mtl_display_hz(); tick = 1.0 / (hz > 0 ? hz : 60); }
+             @autoreleasepool { (void)present_now(&it.t, fmin(it.period / 2, tick), it.frame, ticket, it.crop, nil, 0, it.interp); } }
+         @autoreleasepool { submitted = present_now(&it.t, show_interp ? it.period / 2 : it.period, it.frame, ticket, it.crop, nil, 0, -1); mtl_tex_unpin(it.t.serial); }
+@@ -16696,13 +16698,15 @@
+ /* Frame interpolation at the game's present (game thread; this frame's work is committed, the next frame's not begun): remember the presented texture for the canvas
+    search, then in a command buffer of its own (GPU order: after this frame, before the next) the motion vectors and the frame between the previous and this one.
+    A frame that drew no UI into the canvas (the idle camera hides the HUD) never reached the scene copy: its canvas, which holds the whole picture, is the scene and
+-   the UI layer is cleared. Resets the per-frame state. Returns the output slot of the interpolated frame, or -1. Not with the encode thread (rec_on): its blocks
+-   order the queue, and this buffer would go ahead of the frame */
++   the UI layer is cleared. Resets the per-frame state. Returns the output slot of the interpolated frame, or -1. With the encode thread (rec_on) the buffer is encoded
++   here, on the submit thread, and only its commit goes through the record stream (rec_commit_upload), behind the frame's recorded work; a queue block after it sets the note
++   g_mfx_cmt, and the present shows the generated picture only when its note is reached */
+ static id<MTL4CommandAllocator> g_mfx_alloc[3]; static id<MTL4CommandBuffer> g_mfx_cb[3]; static _Atomic int g_mfx_busy[3];
+-static int mfx_present_frame(const tex_t *t, double period) { @autoreleasepool {
++static uint64_t g_mfx_cmt_v;   // the number given to the last interpolation command buffer (submit thread only); g_mfx_cmt (declared after pq_item) is the newest one that reached the queue
++static int mfx_present_frame(const tex_t *t, double period, uint64_t *cmt_v) { @autoreleasepool {
++    *cmt_v = 0;
+     mfx_note_swap(t);
+     int a = -1; for (int i = 0; i < 3 && a < 0; i++) if (!atomic_load(&g_mfx_busy[i])) a = i;
+-    if (rec_on()) { static int said; if (!said++) MLOG("[RED] [mfx] frame interpolation does not run with the encode thread (DM_NVN_ENC_THREAD=0 turns it off)"); a = -1; }
+     id<MTL4CommandBuffer> cb = nil;
+     if (a >= 0 && !g_mfx_alloc[a]) { g_mfx_alloc[a] = [g_dev newCommandAllocator]; g_mfx_cb[a] = [g_dev newCommandBuffer]; if (!g_mfx_alloc[a] || !g_mfx_cb[a]) MDIE("frame interpolation: no command allocator / buffer"); }
+     id<MTLTexture> canvas = g_mfx.canvas_tex;
+@@ -16750,7 +16754,12 @@
+         [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)keep; if (f.error) MLOG("[RED] [mfx] interpolation command buffer: %s", f.error.description.UTF8String);
+             if (f.GPUEndTime > f.GPUStartTime) mfx_note_gpu((f.GPUEndTime - f.GPUStartTime) * 1e3);
+             atomic_store(busy, 0); }];
+-        pthread_mutex_lock(&g_res_mu); [g_q4 commit:&cb count:1 options:o]; pthread_mutex_unlock(&g_res_mu);
++        if (rec_on() && g_rb_started) {   // in order with the frame's recorded commits, kept with them while a hold is on
++            uint64_t v = ++g_mfx_cmt_v; *cmt_v = v;
++            rec_commit_upload(cb, o);
++            rec_queue_block(^{ rec_note_set(&g_mfx_cmt, v); });
++            rec_publish();   // reaches the encode thread now, not with the next frame's first segment (as the segment cut does)
++        } else { pthread_mutex_lock(&g_res_mu); [g_q4 commit:&cb count:1 options:o]; pthread_mutex_unlock(&g_res_mu); }
+         mfx_mv_log();   // DM_MFX_MVLOG (diagnostic)
+         if (keep && mfx_dump_due()) { while (atomic_load(&g_mfx_busy[a])) usleep(200); mfx_dump((long)atomic_load(&g_cur_frame), nil, nil); }   // DM_MFX_DUMP (diagnostic): waits for the GPU
+     }
+@@ -16778,7 +16787,7 @@
+         else if (st == 2 && now - t0 >= at + dur) { st = 3; mtl_link_pause(0); MLOG("DM_TEST_LINK_STALL: resuming the display link (frame %llu)", (unsigned long long)atomic_load(&g_cur_frame)); }
+     }
+     if (ws_on()) { static uint64_t f0; uint64_t f = atomic_load(&g_cur_frame); if (!f0) f0 = f; else if (f >= f0 + 300) { ws_report(f, f - f0); f0 = f; } }
+-    int islot = t && !ev_val && mfx_on() ? mfx_present_frame(t, period) : -1;   // frame interpolation: the frame shown before this one
++    uint64_t icv = 0; int islot = t && !ev_val && mfx_on() ? mfx_present_frame(t, period, &icv) : -1;   // frame interpolation: the frame shown before this one
+     tex_t snap; uint64_t ss = 0; int slot = 0;
+     if (!ev_val && mtl_snap_on()) {
+         slot = (int)(atomic_load(&g_snap_next) % (uint64_t)g_snap_n);
+@@ -16787,7 +16796,7 @@
+     mtl_tex_pin(t->serial);
+     pthread_mutex_lock(&g_pq_mu);
+     while (g_pq_in - g_pq_done >= PQ) pthread_cond_wait(&g_pq_cv, &g_pq_mu);   // Wait only when the queue is full; normally AcquireTexture blocks first
+-    pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), ev_val, ss ? g_snap[slot].ev : 0, islot, 0, 0};
++    pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), ev_val, ss ? g_snap[slot].ev : 0, islot, 0, 0, icv};
+     if (crop) memcpy(it->crop, crop, sizeof it->crop);   // The current frame's state is enqueued with the ticket number, rather than reading the mutable window late on the present thread
+     uint64_t tk = ++g_pq_in;
+     if (ss) { g_snap[slot].ticket = tk; atomic_fetch_add(&g_snap_next, 1); }
+--- a/dm/gfx/nvn/nvn_rec.h
++++ b/dm/gfx/nvn/nvn_rec.h
+@@ -107,6 +107,8 @@
+     if (atomic_load(p) >= v) return;
+     pthread_mutex_lock(&g_note_mu); while (atomic_load(p) < v) pthread_cond_wait(&g_note_cv, &g_note_mu); pthread_mutex_unlock(&g_note_mu);
+ }
++// Set a note from any thread (a queue block): what the encode thread does at RO_NOTE
++static void rec_note_set(_Atomic uint64_t *p, uint64_t v) { pthread_mutex_lock(&g_note_mu); if (v > atomic_load(p)) atomic_store(p, v); pthread_cond_broadcast(&g_note_cv); pthread_mutex_unlock(&g_note_mu); }
+ 
+ // ---------- Hold (DM_NVN_PREENCODE; local, not for upstream) ----------
+ // Ocarina of Time submits a frame's commands behind a gate (an event wait) that it opens from the CPU only when the GPU has finished the frame before; the commands sat in the
+@@ -281,7 +283,7 @@
+     case RO_LABEL: [(id<MTL4CommandEncoder>)e setLabel:rec_id(a[0])]; break;
+     case RO_R_TS: [(id<MTL4RenderCommandEncoder>)e writeTimestampWithGranularity:a[1] afterStage:a[2] intoHeap:rec_id(a[0]) atIndex:a[3]]; break;
+     case RO_C_TS: [(id<MTL4ComputeCommandEncoder>)e writeTimestampWithGranularity:a[1] intoHeap:rec_id(a[0]) atIndex:a[2]]; break;
+-    case RO_NOTE: { _Atomic uint64_t *p = (_Atomic uint64_t *)(uintptr_t)a[0]; pthread_mutex_lock(&g_note_mu); if (a[1] > atomic_load(p)) atomic_store(p, a[1]); pthread_cond_broadcast(&g_note_cv); pthread_mutex_unlock(&g_note_mu); break; }
++    case RO_NOTE: rec_note_set((_Atomic uint64_t *)(uintptr_t)a[0], a[1]); break;
+     default: MDIE("deferred encoding: unknown record %u", r->op);
+     }
+     for (uint32_t i = 0; i < r->nobj; i++) if (a[i]) CFRelease((CFTypeRef)(uintptr_t)a[i]);
+--- a/dm/gfx/nvn/nvn_mfx.m
++++ b/dm/gfx/nvn/nvn_mfx.m
+@@ -127,12 +127,10 @@
+ /* Local (the launcher's Frame generation row sets DM_MFX_INTERP alone, and the settings window sets DM_FPS_TARGET from its Frame rate row on every Play): interp30 needs the
+    game at 30 frames a second, so it takes the frame rate target over before anything reads it (loader.c dm_fps_state_apply, hle_fpslock.c, hle_nvn.c fps_present_cap).
+    interpmax leaves the target alone: the game runs as without interpolation and every frame it makes gets one frame before it (MacNativeGames' uncapped mode). */
+-/* Both modes turn the encode thread off: frame interpolation does not run with it (nvn_mtl.m mfx_present_frame), and the settings window sets DM_NVN_ENC_THREAD from
+-   its Encode thread row on every Play. */
++/* Frame interpolation runs with the encode thread since 2026-11-11 (local): nvn_mtl.m mfx_present_frame sends its command buffer's commit through the record stream. */
+ __attribute__((constructor)) static void mfx_env(void) {
+     const char *e = getenv("DM_MFX_INTERP");
+     if (!e || (strcmp(e, "interp30") && strcmp(e, "interpmax"))) return;
+-    setenv("DM_NVN_ENC_THREAD", "0", 1);
+     if (!strcmp(e, "interp30")) setenv("DM_FPS_TARGET", "30", 1);
+     /* Local (2026-11-11): interpmax holds late frames (fps_hold on, whatever the profile or the launcher's Hold frames when late says). With the hold off a frame of 3 link
+        ticks shows its generated picture 1 tick and itself 2, and the frame step pays the lateness back as double steps (run B: 514 of 1,800 frames stepped 2 vsyncs, shown

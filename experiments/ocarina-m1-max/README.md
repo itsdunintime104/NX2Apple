@@ -1,0 +1,17 @@
+# Ocarina of Time on an M1 Max: experimental host changes
+
+These are diff files from a private test tree. They are a record, not patches of this repository:
+
+- Base: seedds/nxnative at `04811a63` with the open pull requests 1833, 1951, 1903, 1929, 1846 and 2090 applied, plus a local port of MetalFX frame interpolation (`nvn_mfx.m`).
+- They do **not** apply to this repository's engine pin (`ab41d6a`), and they are not in `patches/series`.
+- Bringing them in as real patches is step 5 of the plan in [`OCARINA-M1-MAX.md`](../../OCARINA-M1-MAX.md).
+
+| File | What it does | State |
+|---|---|---|
+| `01-crash-fix-and-hitch-diagnostic.diff` | Frame generation's UI shader copies are specialized with an empty constant set, so Metal's validation no longer aborts on a shader that declares function constants (pull request 1929 adds one). A log line `[slowcb]` names a command buffer the GPU held for 20 ms or longer. | Crash fix proven by a run. The diagnostic has printed only scene-load lines so far. |
+| `02-frame-generation-with-encode-thread.diff` | The interpolated frame's command buffer is committed through the record stream, in order with the frame's other commits. The presenter shows a generated picture only when its commit has reached the queue. | Proven by one run: 300 of 300 frames interpolated, none dropped, clean exit. |
+| `03-copy-seam-switch.diff` | `DM_NVN_COPY_SEAM` (off by default): a draw pass that follows only the game's texture-to-texture copies and compute dispatches starts its vertex work without waiting for them. Each draw is checked, and a draw that may read GPU-written memory before its fragment stage puts the wait back. The log line counts the opened gaps and why the others stay closed. | No measurable gain. With copies alone it never acted (the game makes 2 a frame). With dispatches it opens about 5 gaps a frame, worth about 0.1 ms, inside the noise. No picture fault seen. Kept as a record of the approach. |
+
+| `04-mdx-seam-and-async-compute.diff` | Two switches, both off by default. `DM_NVN_MDX_SEAM`: the host's own multi-draw masking job that splits the main pass no longer waits for the first half's fragments. `DM_NVN_ASYNC_CS` (the async compute window): a copy step that holds only the game's compute dispatches, each with reads and writes the host can list, ends with a barrier to later compute and copies only. Draw passes after it start without waiting for those dispatches. A pass whose attachments overlap what the dispatches read or write, or a draw that may read what they write (any shader stage, vertex streams, indices, indirect arguments; anything not listable counts) or writes memory from a shader, puts the wait back. | `DM_NVN_MDX_SEAM`: no gain, stays off. `DM_NVN_ASYNC_CS`: works and the picture is correct, but the gain is small (see `OCARINA-M1-MAX.md`, "Results of 11 and 12 Nov: parallel GPU work"). |
+
+No game file, key, address of game code or extracted data is in these files.
